@@ -1,0 +1,58 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+env/
+venv/
+.env/
+.env.*  # archivos de entorno
+
+# Python egg
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Logs
+*.log
+
+# IDEs
+.vscode/
+.idea/
+
+# MacOS
+.DS_Store
+
+# Docker
+*.pid
+*.tar
+*.sock
+
+# PyInstaller
+*.spec
+
+# mypy
+.mypy_cache/
+
+# pytest
+.cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Test coverage
+htmlcov/
+.coverage
+.coverage.*
+
+# Misc
+*.sqlite3
+*.db
+
+# Node (si mezclas JS)
+node_modules/
+
+# Output
+output/
