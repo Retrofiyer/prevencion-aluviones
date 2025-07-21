@@ -1,0 +1,40 @@
+# Entornos virtuales
+venv/
+.env
+.env.*
+
+# Archivos de sistema
+__pycache__/
+*.py[cod]
+*.so
+*.log
+*.db
+*.sqlite3
+.DS_Store
+
+# Configuración de IDEs
+.vscode/
+.idea/
+
+# Archivos de pruebas y caché
+*.pytest_cache/
+.cache/
+.coverage
+htmlcov/
+
+# Archivos de construcción y distribución
+build/
+dist/
+*.egg-info/
+
+# Archivos de Node (si hay)
+node_modules/
+
+# Git
+.git/
+.gitignore
+
+# Archivos Docker innecesarios
+Dockerfile~
+docker-compose.yml~
+*.tar
