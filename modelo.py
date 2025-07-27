@@ -2,15 +2,13 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 import matplotlib.pyplot as plt
+from statsmodels.tsa.arima.model import ARIMA
 from PIL import Image
 import io
 import os
 from dotenv import load_dotenv
 import google.generativeai as genai
 
-# ======================
-# CONFIGURACIÓN
-# ======================
 load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
@@ -25,7 +23,6 @@ def entrenar_modelo():
     df['Mes'] = df['fecha'].dt.month
     df['Año'] = df['fecha'].dt.year
 
-    # Variables rezagadas
     df['precipitacion_lag1'] = df['precipitacion_valor'].shift(1)
     df['temperatura_lag1'] = df['temperatura_valor'].shift(1)
     df['nivel_agua_lag1'] = df['nivel_agua_valor'].shift(1)
@@ -35,19 +32,41 @@ def entrenar_modelo():
     features = ['Mes', 'Año', 'precipitacion_lag1', 'temperatura_lag1', 'nivel_agua_lag1', 'presion_lag1']
 
     modelos = {
-        'precipitacion': RandomForestRegressor(n_estimators=100, random_state=42),
-        'nivel_agua': RandomForestRegressor(n_estimators=100, random_state=42)
+        'rf': {
+            'precipitacion': RandomForestRegressor(n_estimators=100, random_state=42),
+            'nivel_agua': RandomForestRegressor(n_estimators=100, random_state=42)
+        },
+        'arima': {
+            'precipitacion': ARIMA(df['precipitacion_valor'], order=(3, 1, 2)).fit(),
+            'nivel_agua': ARIMA(df['nivel_agua_valor'], order=(2, 1, 2)).fit()
+        }
     }
 
-    modelos['precipitacion'].fit(df[features], df['precipitacion_valor'])
-    modelos['nivel_agua'].fit(df[features], df['nivel_agua_valor'])
+    modelos['rf']['precipitacion'].fit(df[features], df['precipitacion_valor'])
+    modelos['rf']['nivel_agua'].fit(df[features], df['nivel_agua_valor'])
 
     return modelos, df
 
 # ===============================
-# PREDICCIÓN A FUTURO
+# FUNCIÓN DE PRECISIÓN TEMPORAL
 # ===============================
-def predecir_variables(modelos, mes, año, ultimos_valores):
+def calcular_precision_temporal(fecha_objetivo, fecha_ultima):
+    dias_diff = (fecha_objetivo - fecha_ultima).days
+    if dias_diff <= 0:
+        return 1.0
+    max_dias = 365 * 2
+    precision = max(0.3, 1 - (dias_diff / max_dias))
+    return round(precision * 100, 1)
+
+# ===============================
+# PREDICCIÓN A FUTURO CON FUSIÓN
+# ===============================
+def predecir_variables(modelos, mes, año, dia, ultimos_valores, df):
+    fecha_pred = pd.Timestamp(f"{año}-{mes}-{dia}")
+    fecha_ultima = df['fecha'].max()
+    dias_diff = (fecha_pred - fecha_ultima).days
+    alpha = min(1.0, dias_diff / 180)
+
     entrada = [[
         mes,
         año,
@@ -57,16 +76,30 @@ def predecir_variables(modelos, mes, año, ultimos_valores):
         ultimos_valores['presion_valor']
     ]]
 
-    pred = {
-        'precipitacion': modelos['precipitacion'].predict(entrada)[0],
-        'nivel_agua': modelos['nivel_agua'].predict(entrada)[0]
+    pred_rf = {
+        'precipitacion': modelos['rf']['precipitacion'].predict(entrada)[0],
+        'nivel_agua': modelos['rf']['nivel_agua'].predict(entrada)[0]
     }
 
-    pred = {k: max(0, round(v, 2)) for k, v in pred.items()}
-    return pred
+    pasos = dias_diff if dias_diff > 0 else 1
+    pred_arima = {
+        'precipitacion': modelos['arima']['precipitacion'].forecast(steps=pasos).iloc[-1],
+        'nivel_agua': modelos['arima']['nivel_agua'].forecast(steps=pasos).iloc[-1]
+    }
+
+    pred_fusion = {
+        k: round(max(0, alpha * pred_arima[k] + (1 - alpha) * pred_rf[k]), 2)
+        for k in ['precipitacion', 'nivel_agua']
+    }
+
+    precision = calcular_precision_temporal(fecha_pred, fecha_ultima)
+    fechas_precision = pd.date_range(start=fecha_ultima + pd.Timedelta(days=1), end=fecha_pred, freq='D')
+    valores_precision = [calcular_precision_temporal(f, fecha_ultima) for f in fechas_precision]
+
+    return pred_fusion, precision, fechas_precision, valores_precision
 
 # ===============================
-# CREACIÓN DE GRÁFICA VISUAL
+# GRÁFICAS Y GEMINI
 # ===============================
 def crear_grafica(modelo, df, mes, año, variable, color='blue'):
     plt.figure(figsize=(12, 5))
@@ -97,7 +130,6 @@ def crear_grafica(modelo, df, mes, año, variable, color='blue'):
         pred_fechas.append(f)
         pred_valores.append(pred_ajustada)
 
-        # Actualizar valores rezagados
         if variable == 'precipitacion':
             lag_precipitacion = pred_ajustada
         elif variable == 'nivel_agua':
@@ -113,9 +145,7 @@ def crear_grafica(modelo, df, mes, año, variable, color='blue'):
     plt.grid(True)
     plt.legend(loc='upper left')
 
-    # Interpretación separada
     interpretacion = interpretar_variable(variable, pred_valores[-1])
-
     buf = io.BytesIO()
     plt.tight_layout()
     plt.savefig(buf, format='png')
@@ -124,13 +154,24 @@ def crear_grafica(modelo, df, mes, año, variable, color='blue'):
 
     return Image.open(buf), interpretacion
 
-# ===============================
-# INTERPRETACIÓN CON GEMINI
-# ===============================
+def crear_grafica_precision(fechas, precisiones):
+    plt.figure(figsize=(8, 4))
+    plt.plot(fechas, precisiones, marker='o', color='green')
+    plt.ylim(0, 105)
+    plt.title("📉 Precisión esperada del modelo en el tiempo")
+    plt.ylabel("Precisión estimada (%)")
+    plt.xlabel("Fecha de predicción")
+    plt.grid(True)
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format='png')
+    plt.close()
+    buf.seek(0)
+    return Image.open(buf)
+
 def interpretar_con_gemini(pred):
     precip = pred['precipitacion']
     nivel = pred['nivel_agua']
-
     prompt = (
         f"Actúa como experto en prevención de desbordamientos urbanos. Interpreta los siguientes datos climáticos "
         f"para la zona de La Gasca, Quito:\n\n"
@@ -138,7 +179,6 @@ def interpretar_con_gemini(pred):
         f"2. Nivel de agua estimado: {nivel} cm\n\n"
         f"¿Qué riesgo representa esto y qué recomendaciones deberíamos dar a la comunidad?"
     )
-
     try:
         model = genai.GenerativeModel(model_name="models/gemini-2.0-flash")
         response = model.generate_content(prompt)
@@ -149,7 +189,7 @@ def interpretar_con_gemini(pred):
 def interpretar_variable(variable, valor):
     prompt = (
         f"Como experto en clima urbano, explica en máximo 2 líneas qué significa un valor de {valor} para {variable} "
-        f"en La Gasca, Quito. Da una recomendación práctica para la comunidad (prevención, drenaje, evacuación, etc.)."
+        f"en La Gasca, Quito. Da una recomendación práctica para la comunidad."
     )
     try:
         model = genai.GenerativeModel(model_name="models/gemini-2.0-flash")

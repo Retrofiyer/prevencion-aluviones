@@ -1,15 +1,10 @@
 from fastapi import FastAPI
 import gradio as gr
-from modelo import (
-    entrenar_modelo,
-    predecir_variables,
-    crear_grafica,
-    interpretar_con_gemini
-)
+from modelo import entrenar_modelo, predecir_variables, crear_grafica, crear_grafica_precision, interpretar_con_gemini
+import datetime
 import csv
 import os
 
-# Diccionario de meses
 meses_dict = {
     "Enero": 1, "Febrero": 2, "Marzo": 3, "Abril": 4,
     "Mayo": 5, "Junio": 6, "Julio": 7, "Agosto": 8,
@@ -22,16 +17,19 @@ modelos, df = entrenar_modelo()
 # ===============================
 # FUNCIÓN PRINCIPAL DE PREDICCIÓN
 # ===============================
-def interfaz(mes: str, año: int):
+def interfaz(mes: str, año: int, dia: int):
     mes_num = meses_dict[mes]
+    año = int(año)
+    dia = int(dia)
+    ult = df.sort_values(by='fecha').iloc[-1]
     ultimos_valores = {
-        'precipitacion_valor': df['precipitacion_valor'].iloc[-1],
-        'temperatura_valor': df['temperatura_valor'].iloc[-1],
-        'nivel_agua_valor': df['nivel_agua_valor'].iloc[-1],
-        'presion_valor': df['presion_valor'].iloc[-1],
+        'precipitacion_valor': ult['precipitacion_valor'],
+        'temperatura_valor': ult['temperatura_valor'],
+        'nivel_agua_valor': ult['nivel_agua_valor'],
+        'presion_valor': ult['presion_valor'],
     }
 
-    pred = predecir_variables(modelos, mes_num, año, ultimos_valores)
+    pred, precision, fechas_precision, valores_precision = predecir_variables(modelos, mes_num, año, dia, ultimos_valores, df)
 
     if pred["precipitacion"] > 50 and pred["nivel_agua"] > 20:
         consejo = "🚨 Riesgo alto de desbordamiento. Manténgase alerta y revise rutas de evacuación."
@@ -47,10 +45,19 @@ def interfaz(mes: str, año: int):
     texto_consejo = f"🛑 Recomendación: {consejo}"
     explicacion = interpretar_con_gemini(pred)
 
-    graf_precip, exp_p = crear_grafica(modelos['precipitacion'], df, mes_num, año, 'precipitacion', color='blue')
-    graf_nivel, exp_n = crear_grafica(modelos['nivel_agua'], df, mes_num, año, 'nivel_agua', color='teal')
+    graf_precip, exp_p = crear_grafica(modelos['rf']['precipitacion'], df, mes_num, año, 'precipitacion', color='blue')
+    graf_nivel, exp_n = crear_grafica(modelos['rf']['nivel_agua'], df, mes_num, año, 'nivel_agua', color='teal')
+    graf_precision = crear_grafica_precision(fechas_precision, valores_precision)
 
-    return texto_pred, texto_consejo, explicacion, graf_precip, exp_p, graf_nivel, exp_n
+    precision_str = f"📏 Precisión estimada del modelo: {round(precision, 1)}%"
+    if precision < 60:
+        precision_str += " 🔴"
+    elif precision < 80:
+        precision_str += " 🟡"
+    else:
+        precision_str += " 🟢"
+
+    return texto_pred, texto_consejo, explicacion, graf_precip, exp_p, graf_nivel, exp_n, precision_str, graf_precision
 
 # ===============================
 # PESTAÑA INICIO
@@ -163,47 +170,38 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue")) as interfaz_prediccion:
     with gr.Row():
         mes_input = gr.Dropdown(choices=list(meses_dict.keys()), label="📅 Mes de Predicción", value="Junio")
         año_input = gr.Number(label="🗓️ Año de Predicción", value=2026)
+        dia_input = gr.Number(label="📆 Día de Predicción", value=1)
         btn = gr.Button("🔍 Evaluar Riesgo")
 
     with gr.Row():
         pred_output = gr.Textbox(label="📊 Resultados del Modelo", lines=3)
         consejo_output = gr.Textbox(label="🔐 Sugerencia de Prevención", lines=2)
 
-    interpretacion_output = gr.Textbox(label="🤖 Interpretación Técnica con IA", lines=6)
+    interpretacion_output = gr.Textbox(label="🤖 Interpretación Técnica con IA", lines=6, max_lines=10)
 
     with gr.Row():
         graf_precip = gr.Image(label="🌧️ Gráfica: Precipitación", type="pil")
-        interpretacion_precip = gr.Textbox(label="📖 Interpretación Individual: Precipitación", lines=2)
-
-    gr.Markdown(
-        "**🧾 Explicación:**\n"
-        "🔵 Línea azul: datos históricos.\n"
-        "🟠 Línea punteada: tendencia estimada.\n"
-        "⚫ Línea gris: proyección mensual futura.\n"
-        "🔴 Punto rojo: predicción exacta para el mes/año seleccionado."
-    )
+        interpretacion_precip = gr.Textbox(label="📖 Interpretación Individual: Precipitación", lines=3,  max_lines=5)
 
     with gr.Row():
         graf_nivel = gr.Image(label="🌊 Gráfica: Nivel de Agua", type="pil")
-        interpretacion_nivel = gr.Textbox(label="📖 Interpretación Individual: Nivel de Agua", lines=2)
+        interpretacion_nivel = gr.Textbox(label="📖 Interpretación Individual: Nivel de Agua", lines=3,  max_lines=5)
 
-    gr.Markdown(
-        "**🧾 Explicación:**\n"
-        "🔵 Línea celeste: niveles históricos.\n"
-        "🟠 Línea punteada: tendencia del modelo.\n"
-        "⚫ Línea gris: proyección futura.\n"
-        "🔴 Punto rojo: predicción del sistema."
-    )
+    with gr.Row():
+        precision_output = gr.Textbox(label="📏 Precisión del Modelo", lines=1)
+        graf_precision = gr.Image(label="📉 Precisión proyectada", type="pil")
 
     btn.click(
         fn=interfaz,
-        inputs=[mes_input, año_input],
+        inputs=[mes_input, año_input, dia_input],
         outputs=[
             pred_output,
             consejo_output,
             interpretacion_output,
             graf_precip, interpretacion_precip,
-            graf_nivel, interpretacion_nivel
+            graf_nivel, interpretacion_nivel,
+            precision_output,
+            graf_precision
         ]
     )
 
