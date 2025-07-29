@@ -1,9 +1,21 @@
 from fastapi import FastAPI
 import gradio as gr
-from modelo import entrenar_modelo, predecir_variables, crear_grafica, crear_grafica_precision, interpretar_con_gemini
+import plotly.graph_objects as go
+import pandas as pd
 import datetime
-import csv
-import os
+from modelo import (
+    entrenar_modelo,
+    predecir_variables,
+    crear_grafica,
+    crear_grafica_precision,
+    interpretar_con_gemini,  
+    crear_grafica_lineal,
+    crear_grafica_lineal_interactiva,
+    crear_grafica_completa_interactiva
+
+)
+
+app = FastAPI()
 
 meses_dict = {
     "Enero": 1, "Febrero": 2, "Marzo": 3, "Abril": 4,
@@ -11,16 +23,23 @@ meses_dict = {
     "Septiembre": 9, "Octubre": 10, "Noviembre": 11, "Diciembre": 12
 }
 
-app = FastAPI()
+# Entrenamiento de modelos y carga de datos
 modelos, df = entrenar_modelo()
+
+def mostrar_grafico_historico(variable):
+    return crear_grafica_lineal(df, variable)
+
+# Carga de datos históricos reales
+historico_df = pd.read_csv("historico_convertido.csv")
+historico_df["fecha"] = pd.to_datetime(historico_df["fecha"])
 
 # ===============================
 # FUNCIÓN PRINCIPAL DE PREDICCIÓN
 # ===============================
 def interfaz(mes: str, año: int, dia: int):
     mes_num = meses_dict[mes]
-    año = int(año)
-    dia = int(dia)
+    fecha_pred = datetime.date(año, mes_num, dia)
+
     ult = df.sort_values(by='fecha').iloc[-1]
     ultimos_valores = {
         'precipitacion_valor': ult['precipitacion_valor'],
@@ -29,7 +48,9 @@ def interfaz(mes: str, año: int, dia: int):
         'presion_valor': ult['presion_valor'],
     }
 
-    pred, precision, fechas_precision, valores_precision = predecir_variables(modelos, mes_num, año, dia, ultimos_valores, df)
+    pred, precision, fechas_precision, valores_precision = predecir_variables(
+        modelos, mes_num, año, dia, ultimos_valores, df
+    )
 
     if pred["precipitacion"] > 50 and pred["nivel_agua"] > 20:
         consejo = "🚨 Riesgo alto de desbordamiento. Manténgase alerta y revise rutas de evacuación."
@@ -40,13 +61,49 @@ def interfaz(mes: str, año: int, dia: int):
 
     texto_pred = (
         f"🌧️ Precipitación estimada: {pred['precipitacion']} mm\n"
-        f"🌊 Nivel de agua estimado: {pred['nivel_agua']} cm"
+        f"🌊 Nivel de agua estimado: {pred['nivel_agua']} cm\n"
+        f"🌡️ Temperatura estimada: {pred['temperatura']} °C\n"
+        f"📉 Presión atmosférica estimada: {pred['presion']} hPa"
     )
+
+    fila_real = historico_df[historico_df["fecha"] == pd.to_datetime(fecha_pred)]
+    if not fila_real.empty:
+        fila_real = fila_real.iloc[0]
+        comparacion = []
+        for key_pred, key_real, label, unidad in [
+            ("precipitacion", "precipitacion_valor", "🌧️ Precipitación", "mm"),
+            ("nivel_agua", "nivel_agua_valor", "🌊 Nivel de agua", "cm"),
+            ("temperatura", "temperatura_valor", "🌡️ Temperatura", "°C"),
+            ("presion", "presion_valor", "📉 Presión atmosférica", "hPa")
+        ]:
+            predicho = pred[key_pred]
+            real = fila_real[key_real]
+            diferencia = abs(predicho - real)
+            error_pct = round(diferencia / real * 100, 2) if real != 0 else 0
+            comparacion.append(
+                f"{label}: Predicho {predicho} {unidad} vs Real {real} {unidad} → Diferencia: {error_pct}%"
+            )
+        texto_pred += "\n\n📊 Comparación con datos reales:\n" + "\n".join(comparacion)
+    else:
+        texto_pred += "\n\nℹ️ No hay datos reales disponibles para esta fecha."
+
     texto_consejo = f"🛑 Recomendación: {consejo}"
     explicacion = interpretar_con_gemini(pred)
 
-    graf_precip, exp_p = crear_grafica(modelos['rf']['precipitacion'], df, mes_num, año, 'precipitacion', color='blue')
-    graf_nivel, exp_n = crear_grafica(modelos['rf']['nivel_agua'], df, mes_num, año, 'nivel_agua', color='teal')
+    # ✅ Gráficas interactivas con Plotly
+    graf_precip = crear_grafica_completa_interactiva(
+    modelos['rf']['precipitacion'], df, 'precipitacion', mes_num, año, color='blue'
+    )
+
+    graf_nivel = crear_grafica_completa_interactiva(
+        modelos['rf']['nivel_agua'], df, 'nivel_agua', mes_num, año, color='teal'
+    )
+
+    graf_presion = crear_grafica_completa_interactiva(
+        modelos['rf']['presion'], df, 'presion', mes_num, año, color='gray'
+    )
+
+
     graf_precision = crear_grafica_precision(fechas_precision, valores_precision)
 
     precision_str = f"📏 Precisión estimada del modelo: {round(precision, 1)}%"
@@ -57,8 +114,18 @@ def interfaz(mes: str, año: int, dia: int):
     else:
         precision_str += " 🟢"
 
-    return texto_pred, texto_consejo, explicacion, graf_precip, exp_p, graf_nivel, exp_n, precision_str, graf_precision
-
+    return (
+        texto_pred,
+        texto_consejo,
+        explicacion,
+        graf_precip,
+        "Predicción generada para precipitación",
+        graf_nivel,
+        "Predicción generada para nivel de agua",
+        precision_str,
+        graf_precision,
+        graf_presion
+    )
 # ===============================
 # PESTAÑA INICIO
 # ===============================
@@ -180,13 +247,13 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue")) as interfaz_prediccion:
     interpretacion_output = gr.Textbox(label="🤖 Interpretación Técnica con IA", lines=6, max_lines=10)
 
     with gr.Row():
-        graf_precip = gr.Image(label="🌧️ Gráfica: Precipitación", type="pil")
-        interpretacion_precip = gr.Textbox(label="📖 Interpretación Individual: Precipitación", lines=3,  max_lines=5)
+        graf_precip = gr.Plot(label="🌧️ Gráfica: Precipitación")
+        interpretacion_precip = gr.Textbox(label="📖 Interpretación Individual: Precipitación", lines=3, max_lines=5)
 
     with gr.Row():
-        graf_nivel = gr.Image(label="🌊 Gráfica: Nivel de Agua", type="pil")
-        interpretacion_nivel = gr.Textbox(label="📖 Interpretación Individual: Nivel de Agua", lines=3,  max_lines=5)
-
+        graf_nivel = gr.Plot(label="🌊 Gráfica: Nivel de Agua")
+        interpretacion_nivel = gr.Textbox(label="📖 Interpretación Individual: Nivel de Agua", lines=3, max_lines=5)
+        
     with gr.Row():
         precision_output = gr.Textbox(label="📏 Precisión del Modelo", lines=1)
         graf_precision = gr.Image(label="📉 Precisión proyectada", type="pil")
@@ -204,6 +271,35 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue")) as interfaz_prediccion:
             graf_precision
         ]
     )
+    
+#     gr.Markdown("## 📉 Evolución histórica de las variables")
+    
+# # Botón y selector en una fila
+#     with gr.Row():
+#         select_variable_historico = gr.Dropdown(
+#             choices=[
+#                 "precipitacion_valor", 
+#                 "temperatura_valor", 
+#                 "nivel_agua_valor", 
+#                 "presion_valor"
+#             ],
+#             label="Selecciona variable a visualizar",
+#             value="precipitacion_valor"
+#         )
+#         btn_ver_grafico = gr.Button("📊 Ver gráfico histórico")
+
+#     # El gráfico solo, en una fila aparte
+#     with gr.Row():
+#         grafico_historico_output = gr.Plot(label="📈 Gráfico histórico interactivo", elem_id="grafico_historico")
+    
+#     from modelo import crear_grafica_lineal_interactiva
+
+#     btn_ver_grafico.click(
+#         fn=lambda variable: crear_grafica_lineal_interactiva(df, variable),
+#         inputs=select_variable_historico,
+#         outputs=grafico_historico_output
+#     )
+
 
 # ===============================
 # PESTAÑA EDUCATIVA

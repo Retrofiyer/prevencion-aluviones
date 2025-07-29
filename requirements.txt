@@ -8,3 +8,5 @@ google-generativeai
 uvicorn
 pillow
 statsmodels
+plotly
+kaleido
