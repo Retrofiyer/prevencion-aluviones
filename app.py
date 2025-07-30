@@ -3,6 +3,7 @@ import gradio as gr
 import plotly.graph_objects as go
 import pandas as pd
 import datetime
+import csv
 from modelo import (
     entrenar_modelo,
     predecir_variables,
@@ -11,8 +12,8 @@ from modelo import (
     interpretar_con_gemini,  
     crear_grafica_lineal,
     crear_grafica_lineal_interactiva,
-    crear_grafica_completa_interactiva
-
+    crear_grafica_completa_interactiva,
+    interpretar_variable
 )
 
 app = FastAPI()
@@ -103,6 +104,10 @@ def interfaz(mes: str, año: int, dia: int):
         modelos['rf']['presion'], df, 'presion', mes_num, año, color='gray'
     )
 
+    # Generar interpretaciones individuales
+    interpretacion_precip = interpretar_variable('precipitacion', pred['precipitacion'])
+    interpretacion_nivel = interpretar_variable('nivel_agua', pred['nivel_agua'])
+
 
     graf_precision = crear_grafica_precision(fechas_precision, valores_precision)
 
@@ -119,12 +124,11 @@ def interfaz(mes: str, año: int, dia: int):
         texto_consejo,
         explicacion,
         graf_precip,
-        "Predicción generada para precipitación",
+        interpretacion_precip,
         graf_nivel,
-        "Predicción generada para nivel de agua",
+        interpretacion_nivel,
         precision_str,
-        graf_precision,
-        graf_presion
+        graf_precision
     )
 # ===============================
 # PESTAÑA INICIO
@@ -241,22 +245,44 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue")) as interfaz_prediccion:
         btn = gr.Button("🔍 Evaluar Riesgo")
 
     with gr.Row():
-        pred_output = gr.Textbox(label="📊 Resultados del Modelo", lines=3)
-        consejo_output = gr.Textbox(label="🔐 Sugerencia de Prevención", lines=2)
+        with gr.Column(scale=1):
+            pred_output = gr.Textbox(label="📊 Resultados del Modelo", lines=6, max_lines=12, show_copy_button=True)
+        with gr.Column(scale=1):
+            consejo_output = gr.Textbox(label="🔐 Sugerencia de Prevención", lines=6, max_lines=12, show_copy_button=True)
 
-    interpretacion_output = gr.Textbox(label="🤖 Interpretación Técnica con IA", lines=6, max_lines=10)
+    interpretacion_output = gr.Textbox(label="🤖 Interpretación Técnica con IA", lines=8, max_lines=15, show_copy_button=True)
 
+    # Gráfica de Precipitación - Layout mejorado
     with gr.Row():
-        graf_precip = gr.Plot(label="🌧️ Gráfica: Precipitación")
-        interpretacion_precip = gr.Textbox(label="📖 Interpretación Individual: Precipitación", lines=3, max_lines=5)
+        with gr.Column(scale=7):  # 70% del ancho para la gráfica
+            graf_precip = gr.Plot(label="🌧️ Gráfica: Precipitación")
+        with gr.Column(scale=3):  # 30% del ancho para la interpretación
+            interpretacion_precip = gr.Textbox(
+                label="📖 Interpretación Individual: Precipitación", 
+                lines=8, 
+                max_lines=20,
+                show_copy_button=True,
+                interactive=False
+            )
 
+    # Gráfica de Nivel de Agua - Layout mejorado
     with gr.Row():
-        graf_nivel = gr.Plot(label="🌊 Gráfica: Nivel de Agua")
-        interpretacion_nivel = gr.Textbox(label="📖 Interpretación Individual: Nivel de Agua", lines=3, max_lines=5)
+        with gr.Column(scale=7):  # 70% del ancho para la gráfica
+            graf_nivel = gr.Plot(label="🌊 Gráfica: Nivel de Agua")
+        with gr.Column(scale=3):  # 30% del ancho para la interpretación
+            interpretacion_nivel = gr.Textbox(
+                label="📖 Interpretación Individual: Nivel de Agua", 
+                lines=8, 
+                max_lines=20,
+                show_copy_button=True,
+                interactive=False
+            )
         
     with gr.Row():
-        precision_output = gr.Textbox(label="📏 Precisión del Modelo", lines=1)
-        graf_precision = gr.Image(label="📉 Precisión proyectada", type="pil")
+        with gr.Column(scale=2):
+            graf_precision = gr.Image(label="� Precisión proyectada", type="pil")
+        with gr.Column(scale=1):
+            precision_output = gr.Textbox(label="� Precisión del Modelo", lines=2, max_lines=4)
 
     btn.click(
         fn=interfaz,
