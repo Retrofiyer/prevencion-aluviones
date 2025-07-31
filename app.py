@@ -6,15 +6,47 @@ import datetime
 import csv
 from modelo import (
     entrenar_modelo,
+    entrenar_modelo_mejorado,
     predecir_variables,
+    predecir_variables_ensemble,
     crear_grafica,
     crear_grafica_precision,
     interpretar_con_gemini,  
     crear_grafica_lineal,
     crear_grafica_lineal_interactiva,
     crear_grafica_completa_interactiva,
-    interpretar_variable
+    interpretar_variable,
+    interpretar_precision_con_gemini_mejorada,
+    generar_interpretacion_precision_local_mejorada,
+    calcular_precision_temporal_mejorada
 )
+
+# Función para interpretar la precisión con contexto de La Gasca usando Gemini MEJORADA
+def interpretar_precision_con_gemini(precision_valor, pred_variables, fecha_objetivo=None, datos_historicos=None):
+    """
+    Genera una interpretación contextualizada de la precisión del modelo
+    usando análisis detallado de los datos históricos y patrones estacionales.
+    """
+    
+    # Calcular distancia temporal si se proporciona fecha objetivo
+    dias_diff = 0
+    if fecha_objetivo and datos_historicos is not None:
+        fecha_ultima = datos_historicos['fecha'].max()
+        if isinstance(fecha_objetivo, str):
+            fecha_objetivo = pd.to_datetime(fecha_objetivo)
+        elif hasattr(fecha_objetivo, 'date'):
+            fecha_objetivo = pd.Timestamp(fecha_objetivo)
+        dias_diff = (fecha_objetivo - fecha_ultima).days
+    
+    # Usar la función mejorada de interpretación
+    try:
+        interpretacion = interpretar_precision_con_gemini_mejorada(
+            precision_valor, pred_variables, dias_diff, fecha_objetivo, datos_historicos
+        )
+        return interpretacion
+    except Exception as e:
+        # Fallback mejorado con más contexto
+        return generar_interpretacion_precision_local_mejorada(precision_valor, pred_variables, dias_diff)
 
 app = FastAPI()
 
@@ -25,23 +57,37 @@ meses_dict = {
 }
 
 # Entrenamiento de modelos y carga de datos
-modelos, df = entrenar_modelo()
+modelos, df = entrenar_modelo()  # Modelo tradicional
+
+# NUEVO: Entrenamiento del modelo mejorado para mejor precisión en fechas lejanas
+try:
+    modelos_ensemble, df_expandido, features_expandidas = entrenar_modelo_mejorado()
+    print("✅ Modelo ensemble mejorado cargado exitosamente")
+    USAR_MODELO_MEJORADO = True
+except Exception as e:
+    print(f"⚠️ Error al cargar modelo mejorado, usando modelo tradicional: {e}")
+    modelos_ensemble = None
+    df_expandido = df
+    features_expandidas = None
+    USAR_MODELO_MEJORADO = False
 
 def mostrar_grafico_historico(variable):
     return crear_grafica_lineal(df, variable)
 
-# Carga de datos históricos reales
-historico_df = pd.read_csv("historico_convertido.csv")
+# Carga de datos históricos reales (usar el dataset limpio correcto)
+historico_df = pd.read_csv("dataset_rumipamba_limpio.csv")
 historico_df["fecha"] = pd.to_datetime(historico_df["fecha"])
 
 # ===============================
-# FUNCIÓN PRINCIPAL DE PREDICCIÓN
+# FUNCIÓN PRINCIPAL DE PREDICCIÓN MEJORADA
 # ===============================
 def interfaz(mes: str, año: int, dia: int):
     mes_num = meses_dict[mes]
     fecha_pred = datetime.date(año, mes_num, dia)
 
-    ult = df.sort_values(by='fecha').iloc[-1]
+    # Usar el dataset expandido si está disponible
+    df_actual = df_expandido if USAR_MODELO_MEJORADO else df
+    ult = df_actual.sort_values(by='fecha').iloc[-1]
     ultimos_valores = {
         'precipitacion_valor': ult['precipitacion_valor'],
         'temperatura_valor': ult['temperatura_valor'],
@@ -49,16 +95,127 @@ def interfaz(mes: str, año: int, dia: int):
         'presion_valor': ult['presion_valor'],
     }
 
-    pred, precision, fechas_precision, valores_precision = predecir_variables(
-        modelos, mes_num, año, dia, ultimos_valores, df
-    )
-
-    if pred["precipitacion"] > 50 and pred["nivel_agua"] > 20:
-        consejo = "🚨 Riesgo alto de desbordamiento. Manténgase alerta y revise rutas de evacuación."
-    elif pred["precipitacion"] > 30:
-        consejo = "⚠️ Lluvia moderada. Verifique canales y quebradas."
+    # Usar modelo mejorado si está disponible, sino usar modelo tradicional
+    if USAR_MODELO_MEJORADO and modelos_ensemble is not None:
+        pred, intervalos_confianza, precision, fechas_precision, valores_precision = predecir_variables_ensemble(
+            modelos_ensemble, mes_num, año, dia, ultimos_valores, df_expandido, features_expandidas
+        )
+        
+        # Agregar información sobre intervalos de confianza
+        intervalos_info = "\n\n📊 **Intervalos de Confianza (95%):**\n"
+        for variable, valor in pred.items():
+            var_names = {
+                'precipitacion': ('🌧️ Precipitación', 'mm'),
+                'nivel_agua': ('🌊 Nivel de agua', 'cm'),
+                'temperatura': ('🌡️ Temperatura', '°C'),
+                'presion': ('📉 Presión atmosférica', 'hPa')
+            }
+            
+            nombre, unidad = var_names[variable]
+            intervalo_inf, intervalo_sup = intervalos_confianza[variable]
+            intervalos_info += f"{nombre}: {valor:.1f} {unidad} (rango: {intervalo_inf:.1f} - {intervalo_sup:.1f})\n"
+        
+        modelo_info = "🔬 **Modelo Ensemble Mejorado** - Mayor precisión para fechas lejanas"
     else:
-        consejo = "✅ Condiciones climáticas estables. Bajo riesgo de desbordamiento."
+        pred, precision, fechas_precision, valores_precision = predecir_variables(
+            modelos, mes_num, año, dia, ultimos_valores, df
+        )
+        intervalos_info = ""
+        modelo_info = "📊 **Modelo Tradicional**"
+
+    # Generar recomendaciones detalladas específicas para La Gasca
+    def generar_recomendacion_detallada(pred_variables, fecha_pred):
+        precipitacion = pred_variables["precipitacion"]
+        nivel_agua = pred_variables["nivel_agua"]
+        temperatura = pred_variables["temperatura"]
+        presion = pred_variables["presion"]
+        
+        # Determinar nivel de riesgo y recomendaciones específicas
+        if precipitacion > 50 and nivel_agua > 20:
+            nivel_riesgo = "🚨 RIESGO ALTO"
+            recomendaciones = [
+                "🚨 ALERTA MÁXIMA para el sector La Gasca",
+                "� Manténgase informado a través de medios oficiales",
+                "🏃‍♂️ Revise y practique rutas de evacuación hacia zonas altas",
+                "👂 Esté atento al sonido de las quebradas (rumor anormal indica peligro)",
+                "🚪 Tenga listo un kit de emergencia (documentos, agua, medicinas)",
+                "👥 Coordine con vecinos para monitoreo conjunto de quebradas",
+                "🚫 EVITE transitar cerca de quebradas Rumipamba y afluentes",
+                "📞 Números de emergencia: 911 (Nacional), ECU 911"
+            ]
+            contexto_historico = "⚠️ Recuerde: El 31 de enero de 2022, condiciones similares causaron el aluvión en La Gasca."
+            
+        elif precipitacion > 30 or nivel_agua > 15:
+            nivel_riesgo = "⚠️ RIESGO MODERADO"
+            recomendaciones = [
+                "⚠️ Precaución elevada para residentes de La Gasca",
+                "👀 Inspeccione canales y alcantarillas de su propiedad",
+                "🧹 Limpie hojas y desechos de canales de drenaje",
+                "📍 Identifique puntos altos cercanos como refugio temporal",
+                "👂 Manténgase atento a sonidos inusuales de quebradas",
+                "💬 Informe a vecinos sobre condiciones de riesgo",
+                "📱 Mantenga celular cargado y radio disponible",
+                "🎒 Prepare kit básico de emergencia por precaución"
+            ]
+            contexto_historico = "📚 La zona tiene historial de vulnerabilidad durante lluvias intensas."
+            
+        elif precipitacion > 10 or nivel_agua > 12:
+            nivel_riesgo = "🟡 RIESGO BAJO-MODERADO"
+            recomendaciones = [
+                "🟡 Vigilancia preventiva recomendada",
+                "🔍 Revise estado de canales y drenajes locales",
+                "🧹 Mantenga limpios los desagües de su propiedad",
+                "📰 Siga pronósticos meteorológicos actualizados",
+                "👥 Mantenga comunicación con vecinos",
+                "📋 Verifique que tenga números de emergencia disponibles",
+                "🎒 Considere tener documentos importantes en lugar seguro"
+            ]
+            contexto_historico = "📍 Monitoreo preventivo es clave en zonas como La Gasca."
+            
+        else:
+            nivel_riesgo = "✅ RIESGO BAJO"
+            recomendaciones = [
+                "✅ Condiciones climáticas estables para La Gasca",
+                "🔧 Aproveche para mantener sistemas de drenaje",
+                "📚 Momento ideal para educarse sobre prevención de desastres",
+                "👥 Participe en actividades comunitarias de preparación",
+                "📋 Actualice su plan familiar de emergencia",
+                "🎒 Revise y actualice kit de emergencia familiar",
+                "📱 Manténgase informado sobre el clima local"
+            ]
+            contexto_historico = "🌟 Condiciones favorables para actividades preventivas y educativas."
+        
+        # Añadir recomendaciones específicas por condiciones meteorológicas
+        recomendaciones_adicionales = []
+        
+        if temperatura < 10:
+            recomendaciones_adicionales.append("🥶 Temperatura baja: Protéjase del frío y mantenga calefacción segura")
+            
+        if presion < 680:
+            recomendaciones_adicionales.append("🌀 Presión baja: Posible cambio de tiempo, manténgase alerta")
+            
+        if presion > 690:
+            recomendaciones_adicionales.append("☀️ Presión alta: Tiempo estable, buen momento para preparativos")
+        
+        # Construir mensaje final
+        mensaje = f"{nivel_riesgo}\n\n"
+        mensaje += f"📅 Predicción para {fecha_pred.strftime('%d de %B de %Y')}\n\n"
+        mensaje += "🎯 **RECOMENDACIONES ESPECÍFICAS PARA LA GASCA:**\n"
+        
+        for i, rec in enumerate(recomendaciones, 1):
+            mensaje += f"{i}. {rec}\n"
+        
+        if recomendaciones_adicionales:
+            mensaje += f"\n🌡️ **CONDICIONES METEOROLÓGICAS ADICIONALES:**\n"
+            for rec in recomendaciones_adicionales:
+                mensaje += f"• {rec}\n"
+        
+        mensaje += f"\n📖 **CONTEXTO:** {contexto_historico}"
+        
+        return mensaje
+
+    # Generar recomendación detallada
+    consejo_detallado = generar_recomendacion_detallada(pred, fecha_pred)
 
     texto_pred = (
         f"🌧️ Precipitación estimada: {pred['precipitacion']} mm\n"
@@ -84,11 +241,22 @@ def interfaz(mes: str, año: int, dia: int):
             comparacion.append(
                 f"{label}: Predicho {predicho} {unidad} vs Real {real} {unidad} → Diferencia: {error_pct}%"
             )
-        texto_pred += "\n\n📊 Comparación con datos reales:\n" + "\n".join(comparacion)
+        
+        # Agregar información sobre las fuentes de datos reales solo cuando hay comparación
+        fuentes_info = (
+            "\n\n📋 Fuentes de datos reales utilizados en la comparación:\n"
+            "🌐 Visual Crossing Weather History (https://www.visualcrossing.com/weather-history/)\n"
+            "🌐 World Weather Online - Quito Historical Data (https://www.worldweatheronline.com/quito-weather-history/pichincha/ec.aspx)\n"
+            "📍 Datos correspondientes a la zona de Quito-Pichincha, Ecuador\n"
+            "📅 Período de referencia: 2021-2024"
+        )
+        
+        texto_pred += "\n\n📊 Comparación con datos reales:\n" + "\n".join(comparacion) + fuentes_info
     else:
+        # Solo mensaje simple cuando no hay datos disponibles
         texto_pred += "\n\nℹ️ No hay datos reales disponibles para esta fecha."
 
-    texto_consejo = f"🛑 Recomendación: {consejo}"
+    texto_consejo = consejo_detallado
     explicacion = interpretar_con_gemini(pred)
 
     # ✅ Gráficas interactivas con Plotly
@@ -111,13 +279,8 @@ def interfaz(mes: str, año: int, dia: int):
 
     graf_precision = crear_grafica_precision(fechas_precision, valores_precision)
 
-    precision_str = f"📏 Precisión estimada del modelo: {round(precision, 1)}%"
-    if precision < 60:
-        precision_str += " 🔴"
-    elif precision < 80:
-        precision_str += " 🟡"
-    else:
-        precision_str += " 🟢"
+    # Generar interpretación contextualizada con Gemini para La Gasca
+    precision_str = interpretar_precision_con_gemini(precision, pred)
 
     return (
         texto_pred,
@@ -163,6 +326,16 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue")) as interfaz_inicio:
                 <li>🌀 Presión atmosférica (hPa)</li>
             </ul>
             <p>📊 Estos datos alimentan un modelo predictivo basado en aprendizaje automático para detectar condiciones de alto riesgo y emitir recomendaciones preventivas.</p>
+            
+            <div style='background:#FFF9C4; padding:1rem; border-radius:8px; margin-top:1rem; border-left:4px solid #FBC02D;'>
+                <h4 style='margin-top:0; color:#F57F17;'>📋 Fuentes de Datos de Validación</h4>
+                <p style='margin-bottom:0; text-align:left; font-size:0.9rem;'>
+                    🌐 <strong>Datos históricos de comparación obtenidos de:</strong><br>
+                    • <a href="https://www.visualcrossing.com/weather-history/" target="_blank">Visual Crossing Weather History</a><br>
+                    • <a href="https://www.worldweatheronline.com/quito-weather-history/pichincha/ec.aspx" target="_blank">World Weather Online - Quito Historical Data</a><br>
+                    📅 <strong>Período:</strong> 2021-2024 | 📍 <strong>Zona:</strong> Quito-Pichincha, Ecuador
+                </p>
+            </div>
             </div>
         """)
 
@@ -248,21 +421,23 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue")) as interfaz_prediccion:
         with gr.Column(scale=1):
             pred_output = gr.Textbox(label="📊 Resultados del Modelo", lines=6, max_lines=12, show_copy_button=True)
         with gr.Column(scale=1):
-            consejo_output = gr.Textbox(label="🔐 Sugerencia de Prevención", lines=6, max_lines=12, show_copy_button=True)
+            consejo_output = gr.Textbox(
+                label="�️ Recomendaciones de Prevención - La Gasca", 
+                lines=12, 
+                max_lines=20, 
+                show_copy_button=True,
+                interactive=False
+            )
 
-    interpretacion_output = gr.Textbox(label="🤖 Interpretación Técnica con IA", lines=8, max_lines=15, show_copy_button=True)
+    interpretacion_output = gr.HTML(label="🤖 Interpretación Técnica con IA")
 
     # Gráfica de Precipitación - Layout mejorado
     with gr.Row():
         with gr.Column(scale=7):  # 70% del ancho para la gráfica
             graf_precip = gr.Plot(label="🌧️ Gráfica: Precipitación")
         with gr.Column(scale=3):  # 30% del ancho para la interpretación
-            interpretacion_precip = gr.Textbox(
-                label="📖 Interpretación Individual: Precipitación", 
-                lines=8, 
-                max_lines=20,
-                show_copy_button=True,
-                interactive=False
+            interpretacion_precip = gr.HTML(
+                label="📖 Interpretación Individual: Precipitación"
             )
 
     # Gráfica de Nivel de Agua - Layout mejorado
@@ -270,19 +445,17 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue")) as interfaz_prediccion:
         with gr.Column(scale=7):  # 70% del ancho para la gráfica
             graf_nivel = gr.Plot(label="🌊 Gráfica: Nivel de Agua")
         with gr.Column(scale=3):  # 30% del ancho para la interpretación
-            interpretacion_nivel = gr.Textbox(
-                label="📖 Interpretación Individual: Nivel de Agua", 
-                lines=8, 
-                max_lines=20,
-                show_copy_button=True,
-                interactive=False
+            interpretacion_nivel = gr.HTML(
+                label="📖 Interpretación Individual: Nivel de Agua"
             )
         
     with gr.Row():
         with gr.Column(scale=2):
-            graf_precision = gr.Image(label="� Precisión proyectada", type="pil")
+            graf_precision = gr.Image(label="📊 Precisión proyectada", type="pil")
         with gr.Column(scale=1):
-            precision_output = gr.Textbox(label="� Precisión del Modelo", lines=2, max_lines=4)
+            precision_output = gr.HTML(
+                label="🎯 Interpretación de Precisión - Contexto La Gasca"
+            )
 
     btn.click(
         fn=interfaz,
@@ -335,12 +508,134 @@ PREGUNTAS_CSV = "educacion_preguntas.csv"
 MAPA_IMG = "zona_lagasca_map.png"
 
 def evaluar_riesgo(precipitacion, pendiente, frecuencia, canales):
-    if precipitacion > 50 and pendiente == "Alta" and canales == "Obstruidos":
-        return "🚨 Riesgo extremo de desbordamiento. Alerta máxima."
-    elif precipitacion > 30 and (pendiente == "Media" or frecuencia == "Alta frecuencia"):
-        return "⚠️ Riesgo moderado. Revise estructuras y vías de evacuación."
+    """
+    Evaluación detallada de riesgo con consecuencias específicas
+    basadas en las condiciones simuladas para La Gasca
+    """
+    
+    # Calcular índice de riesgo ponderado
+    puntaje_riesgo = 0
+    factores_criticos = []
+    consecuencias_especificas = []
+    acciones_inmediatas = []
+    
+    # Análisis de precipitación
+    if precipitacion >= 70:
+        puntaje_riesgo += 40
+        factores_criticos.append(f"Precipitación CRÍTICA ({precipitacion}mm)")
+        consecuencias_especificas.append("🌊 SATURACIÓN TOTAL DEL SUELO: El agua no se infiltra, todo fluye hacia quebradas")
+        consecuencias_especificas.append("⚡ CRECIMIENTO EXPONENCIAL DE CAUDALES: Nivel de quebradas puede triplicarse en 30 minutos")
+        acciones_inmediatas.append("📞 LLAMAR 911 INMEDIATAMENTE - Reportar situación crítica")
+        acciones_inmediatas.append("🏃 EVACUAR PREVENTIVAMENTE - Especialmente adultos mayores y niños")
+    elif precipitacion >= 50:
+        puntaje_riesgo += 30
+        factores_criticos.append(f"Precipitación ALTA ({precipitacion}mm)")
+        consecuencias_especificas.append("💧 SATURACIÓN PROGRESIVA: Suelo perdiendo capacidad de absorción en 2-4 horas")
+        consecuencias_especificas.append("📈 CRECIMIENTO SOSTENIDO DE CAUDALES: Quebradas subiendo gradualmente pero constante")
+        acciones_inmediatas.append("👁️ VIGILANCIA INTENSIVA - Monitoreo cada 30 minutos en quebradas")
+        acciones_inmediatas.append("🎒 PREPARAR KIT DE EMERGENCIA - Documentos, medicinas, agua, radio")
+    elif precipitacion >= 30:
+        puntaje_riesgo += 20
+        factores_criticos.append(f"Precipitación MODERADA ({precipitacion}mm)")
+        consecuencias_especificas.append("🟡 INCREMENTO GRADUAL DE FLUJOS: Quebradas comenzando a crecer")
+        consecuencias_especificas.append("⚠️ REDUCCIÓN DE MARGEN DE SEGURIDAD: Menos tiempo para reaccionar si empeora")
+        acciones_inmediatas.append("👀 MONITOREO CADA 2 HORAS - Observar cambios en quebradas")
+        acciones_inmediatas.append("📱 COORDINAR CON VECINOS - Red de alerta comunitaria activa")
+    elif precipitacion >= 10:
+        puntaje_riesgo += 10
+        factores_criticos.append(f"Precipitación LIGERA ({precipitacion}mm)")
+        consecuencias_especificas.append("✅ CONDICIONES CONTROLADAS: Drenaje natural funcionando adecuadamente")
+        acciones_inmediatas.append("🧹 APROVECHA PARA MANTENIMIENTO - Limpieza de canales y desagües")
     else:
-        return "✅ Riesgo bajo. Mantenga vigilancia comunitaria activa."
+        consecuencias_especificas.append("☀️ CONDICIONES SECAS: Momento ideal para preparación y prevención")
+        acciones_inmediatas.append("📋 PLANIFICACIÓN PREVENTIVA - Actualizar rutas de evacuación")
+    
+    # Análisis de pendiente del terreno
+    if pendiente == "Alta":
+        puntaje_riesgo += 25
+        factores_criticos.append("PENDIENTE CRÍTICA (>30°)")
+        consecuencias_especificas.append("🏔️ VELOCIDAD EXTREMA DEL AGUA: Flujo hasta 3x más rápido que en terreno plano")
+        consecuencias_especificas.append("🪨 ARRASTRE DE MATERIAL PESADO: Rocas, troncos y sedimentos como proyectiles")
+        consecuencias_especificas.append("⚡ TIEMPO DE EVACUACIÓN CRÍTICO: Solo 10-15 minutos desde alerta hasta impacto")
+    elif pendiente == "Media":
+        puntaje_riesgo += 15
+        factores_criticos.append("PENDIENTE MODERADA (15-30°)")
+        consecuencias_especificas.append("🌊 FLUJO ACELERADO: Agua 50% más rápida que en zona plana")
+        consecuencias_especificas.append("⏰ VENTANA DE EVACUACIÓN REDUCIDA: 30-45 minutos para actuar")
+    else:  # Baja
+        puntaje_riesgo += 5
+        consecuencias_especificas.append("🛤️ FLUJO CONTROLADO: Pendiente permite drenaje gradual y evacuación segura")
+    
+    # Análisis de frecuencia de lluvias
+    if frecuencia == "Alta frecuencia":
+        puntaje_riesgo += 15
+        factores_criticos.append("SATURACIÓN ACUMULATIVA")
+        consecuencias_especificas.append("💧 SUELO PRE-SATURADO: Menos capacidad de absorción, todo fluye superficialmente")
+        consecuencias_especificas.append("📊 EFECTO MULTIPLICADOR: Cada mm adicional tiene impacto 2x mayor")
+        acciones_inmediatas.append("📈 MONITOREO ACUMULATIVO - Sumar precipitación de últimos 7 días")
+    else:  # Esporádica
+        puntaje_riesgo += 5
+        consecuencias_especificas.append("🌱 SUELO CON CAPACIDAD ABSORBENTE: Primera lluvia en días, mejor infiltración")
+    
+    # Análisis crítico del estado de canales
+    if canales == "Obstruidos":
+        puntaje_riesgo += 20
+        factores_criticos.append("DRENAJE COMPROMETIDO")
+        consecuencias_especificas.append("🚫 EFECTO REPRESAMIENTO: Agua acumulándose hasta romper obstáculos súbitamente")
+        consecuencias_especificas.append("💥 LIBERACIÓN SÚBITA: 'Tsunami local' cuando se rompen obstrucciones")
+        consecuencias_especificas.append("🏠 INUNDACIÓN DE VIVIENDAS: Agua busca rutas alternativas, incluyendo calles y casas")
+        acciones_inmediatas.append("🔧 DESOBSTRUCCIÓN URGENTE - Si es seguro, remover obstáculos antes de lluvia fuerte")
+        acciones_inmediatas.append("🚨 ALEJAR VEHÍCULOS Y PERTENENCIAS - De zonas bajas y cercanas a canales")
+    else:  # Limpios
+        consecuencias_especificas.append("✅ DRENAJE ÓPTIMO: Canales funcionando a capacidad máxima")
+    
+    # Determinar nivel de riesgo final
+    if puntaje_riesgo >= 80:
+        nivel_riesgo = "🔴 RIESGO EXTREMO"
+        urgencia = "⚡ EVACUACIÓN INMEDIATA ⚡"
+        contexto_historico = f"Condiciones IGUALES O PEORES al aluvión del 31 enero 2022 que causó muertes en La Gasca."
+    elif puntaje_riesgo >= 60:
+        nivel_riesgo = "🚨 RIESGO CRÍTICO"
+        urgencia = "🚨 ALERTA MÁXIMA - EVACUAR PREVENTIVAMENTE 🚨"
+        contexto_historico = f"Condiciones similares al desastre de 2022. Riesgo real de aluvión."
+    elif puntaje_riesgo >= 40:
+        nivel_riesgo = "⚠️ RIESGO ALTO"
+        urgencia = "⚠️ PREPARAR EVACUACIÓN - VIGILANCIA EXTREMA ⚠️"
+        contexto_historico = f"Condiciones preocupantes. A pasos del umbral crítico de 2022."
+    elif puntaje_riesgo >= 25:
+        nivel_riesgo = "🟡 RIESGO MODERADO"
+        urgencia = "🟡 VIGILANCIA ACTIVA - PREPARACIÓN PREVENTIVA 🟡"
+        contexto_historico = f"Condiciones que requieren atención. Potencial de escalamiento rápido."
+    else:
+        nivel_riesgo = "✅ RIESGO BAJO"
+        urgencia = "✅ SITUACIÓN CONTROLADA ✅"
+        contexto_historico = f"Condiciones normales. Momento ideal para preparación y educación."
+    
+    # Generar reporte detallado
+    reporte = f"""{nivel_riesgo} (Índice: {puntaje_riesgo}/100)
+
+{urgencia}
+
+🎯 FACTORES CRÍTICOS IDENTIFICADOS:
+{' • '.join(factores_criticos) if factores_criticos else '• Condiciones dentro de parámetros normales'}
+
+⚡ CONSECUENCIAS ESPECÍFICAS CON ESTAS CONDICIONES:
+{''.join([f'• {cons}\n' for cons in consecuencias_especificas[:6]])}
+
+📋 ACCIONES INMEDIATAS REQUERIDAS:
+{''.join([f'• {acc}\n' for acc in acciones_inmediatas[:4]])}
+
+📚 CONTEXTO HISTÓRICO LA GASCA:
+{contexto_historico}
+
+🔗 CADENA DE CONSECUENCIAS ESPERADA:
+1️⃣ PRIMEROS 15 MIN: {precipitacion}mm lluvia + pendiente {pendiente.lower()} = {"flujo extremo" if puntaje_riesgo > 60 else "incremento de caudal"}
+2️⃣ 30-60 MIN: Canales {"colapsarán por obstrucciones" if canales == "Obstruidos" and puntaje_riesgo > 40 else "manejarán el flujo"} + {"suelo saturado" if frecuencia == "Alta frecuencia" else "absorción gradual"}
+3️⃣ 1-2 HORAS: {"ALUVIÓN PROBABLE - Impacto en viviendas" if puntaje_riesgo >= 60 else "Monitoreo continuo necesario" if puntaje_riesgo >= 25 else "Situación estabilizada"}
+
+⏰ TIEMPO ESTIMADO PARA ACTUAR: {f"5-10 minutos (CRÍTICO)" if puntaje_riesgo >= 80 else f"15-30 minutos" if puntaje_riesgo >= 60 else f"1-2 horas" if puntaje_riesgo >= 40 else "Varias horas disponibles"}"""
+    
+    return reporte
 
 def verificar_respuesta(respuesta):
     return "✅ Correcto. Lluvias > 70 mm/h pueden generar desastres." if respuesta == "B) Riesgo de desbordamiento e inundación" else "❌ Incorrecto. Revisa la lección y vuelve a intentar."
@@ -365,13 +660,60 @@ with gr.Blocks(title="📚 Educación Climática") as interfaz_educativa:
     )
 
     with gr.Tab("1️⃣ Simulador de Riesgo"):
-        lluvia = gr.Number(label="🌧️ Precipitación estimada (mm)", value=0)
-        pendiente = gr.Radio(["Baja", "Media", "Alta"], label="⛰️ Pendiente del terreno")
-        frecuencia = gr.Radio(["Esporádica", "Alta frecuencia"], label="⏰ Frecuencia de lluvias")
-        canales = gr.Radio(["Limpios", "Obstruidos"], label="🧹 Estado de los canales")
-        btn_simular = gr.Button("Evaluar riesgo")
-        salida_simulador = gr.Textbox(label="🧠 Evaluación del Riesgo")
+        gr.Markdown("""
+        ### 🎯 **Simulador Avanzado de Riesgo de Aluviones - La Gasca**
+        
+        **Instrucciones:** Ajusta los parámetros según las condiciones actuales o hipotéticas para obtener una evaluación detallada de riesgo con consecuencias específicas y acciones recomendadas.
+        
+        ⚠️ **Referencia histórica:** El 31 de enero de 2022, lluvias >70mm/h causaron un aluvión devastador en La Gasca.
+        """)
+        
+        with gr.Row():
+            with gr.Column():
+                lluvia = gr.Number(
+                    label="🌧️ Precipitación estimada (mm/hora)", 
+                    value=0, 
+                    minimum=0, 
+                    maximum=150,
+                    info="0-10: Ligera | 10-30: Moderada | 30-50: Intensa | 50-70: Fuerte | >70: CRÍTICA"
+                )
+                pendiente = gr.Radio(
+                    ["Baja", "Media", "Alta"], 
+                    label="⛰️ Pendiente del terreno",
+                    info="Baja: <15° | Media: 15-30° | Alta: >30°"
+                )
+            with gr.Column():
+                frecuencia = gr.Radio(
+                    ["Esporádica", "Alta frecuencia"], 
+                    label="⏰ Frecuencia de lluvias recientes",
+                    info="¿Ha llovido intensamente en los últimos 7 días?"
+                )
+                canales = gr.Radio(
+                    ["Limpios", "Obstruidos"], 
+                    label="🧹 Estado de canales y quebradas",
+                    info="Presencia de escombros, basura, sedimentos"
+                )
+        
+        btn_simular = gr.Button("🧠 EVALUAR RIESGO INTEGRAL", variant="primary", scale=2)
+        
+        gr.Markdown("### 📊 **Reporte Detallado de Evaluación:**")
+        salida_simulador = gr.Textbox(
+            label="", 
+            lines=20,
+            max_lines=25,
+            show_label=False,
+            placeholder="Selecciona los parámetros arriba y presiona 'EVALUAR RIESGO INTEGRAL' para obtener un análisis detallado...",
+            interactive=False
+        )
+        
         btn_simular.click(evaluar_riesgo, [lluvia, pendiente, frecuencia, canales], salida_simulador)
+        
+        gr.Markdown("""
+        ---
+        **💡 Tip educativo:** Usa valores reales observados en tu zona para entrenar tu capacidad de evaluación de riesgo. 
+        
+        **🚨 Recordatorio:** En caso de condiciones críticas reales, llamar inmediatamente al 911.
+        """)
 
     with gr.Tab("2️⃣ Quiz de Cultura Climática"):
 

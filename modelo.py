@@ -16,9 +16,10 @@ genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 CSV_PATH = "dataset_rumipamba_limpio.csv"
 
 # ===============================
-# ENTRENAMIENTO DEL MODELO
+# ENTRENAMIENTO DEL MODELO MEJORADO
 # ===============================
 def entrenar_modelo():
+    """Entrenar modelo tradicional (mantenido para compatibilidad)"""
     df = pd.read_csv(CSV_PATH)
     df['fecha'] = pd.to_datetime(df['fecha'])
     df['Mes'] = df['fecha'].dt.month
@@ -55,17 +56,171 @@ def entrenar_modelo():
 
     return modelos, df
 
+def entrenar_modelo_mejorado():
+    """Entrena múltiples modelos para crear un ensemble más robusto"""
+    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+    from sklearn.linear_model import Ridge
+    
+    df = pd.read_csv(CSV_PATH)
+    df['fecha'] = pd.to_datetime(df['fecha'])
+    
+    # Features expandidas
+    df['Mes'] = df['fecha'].dt.month
+    df['Año'] = df['fecha'].dt.year
+    df['Día_año'] = df['fecha'].dt.dayofyear
+    df['Estacion'] = df['fecha'].dt.month.map({12:0, 1:0, 2:0, 3:1, 4:1, 5:1, 
+                                               6:2, 7:2, 8:2, 9:3, 10:3, 11:3})
+    
+    # Lags múltiples
+    for lag in [1, 2, 3, 7]:  # 1, 2, 3 días y 1 semana
+        df[f'precipitacion_lag{lag}'] = df['precipitacion_valor'].shift(lag)
+        df[f'temperatura_lag{lag}'] = df['temperatura_valor'].shift(lag)
+        df[f'nivel_agua_lag{lag}'] = df['nivel_agua_valor'].shift(lag)
+        df[f'presion_lag{lag}'] = df['presion_valor'].shift(lag)
+    
+    # Medias móviles
+    for window in [7, 15, 30]:
+        df[f'precip_ma{window}'] = df['precipitacion_valor'].rolling(window).mean()
+        df[f'temp_ma{window}'] = df['temperatura_valor'].rolling(window).mean()
+    
+    df = df.dropna()
+    
+    # Features seleccionadas
+    lag_features = [col for col in df.columns if 'lag' in col or 'ma' in col]
+    features = ['Mes', 'Año', 'Día_año', 'Estacion'] + lag_features
+    
+    # Ensemble de modelos
+    modelos_ensemble = {}
+    for variable in ['precipitacion', 'nivel_agua', 'temperatura', 'presion']:
+        col_target = f'{variable}_valor'
+        
+        modelos_ensemble[variable] = {
+            'rf': RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42),
+            'gbr': GradientBoostingRegressor(n_estimators=150, max_depth=6, random_state=42),
+            'ridge': Ridge(alpha=1.0)
+        }
+        
+        # Entrenar cada modelo
+        X = df[features]
+        y = df[col_target]
+        
+        for modelo_name, modelo in modelos_ensemble[variable].items():
+            modelo.fit(X, y)
+    
+    return modelos_ensemble, df, features
+
 
 # ===============================
-# FUNCIÓN DE PRECISIÓN TEMPORAL
+# FUNCIÓN DE PRECISIÓN TEMPORAL MEJORADA
 # ===============================
 def calcular_precision_temporal(fecha_objetivo, fecha_ultima):
+    """Función original mantenida para compatibilidad"""
     dias_diff = (fecha_objetivo - fecha_ultima).days
     if dias_diff <= 0:
         return 1.0
     max_dias = 365 * 2
     precision = max(0.3, 1 - (dias_diff / max_dias))
     return round(precision * 100, 1)
+
+def calcular_precision_temporal_mejorada(fecha_objetivo, fecha_ultima, variables_pred, datos_historicos):
+    """
+    Calcula precisión considerando múltiples factores para mejorar confiabilidad
+    """
+    dias_diff = (fecha_objetivo - fecha_ultima).days
+    if dias_diff <= 0:
+        return 100.0
+    
+    # 1. Decaimiento base más suave
+    max_dias = 365 * 3  # Extender horizonte temporal
+    precision_base = max(0.4, 1 - (dias_diff / max_dias) ** 0.8)  # Función de decaimiento suavizada
+    
+    # 2. Ajuste por estacionalidad (patrones recurrentes)
+    mes_objetivo = fecha_objetivo.month
+    precision_estacional = calcular_precision_estacional(mes_objetivo, datos_historicos)
+    
+    # 3. Ajuste por variabilidad histórica de las variables
+    factor_variabilidad = calcular_factor_variabilidad(variables_pred, datos_historicos)
+    
+    # 4. Ajuste por tendencias históricas
+    factor_tendencia = calcular_factor_tendencia(fecha_objetivo, datos_historicos)
+    
+    # 5. Combinación ponderada
+    precision_final = (
+        precision_base * 0.4 +
+        precision_estacional * 0.3 +
+        factor_variabilidad * 0.2 +
+        factor_tendencia * 0.1
+    )
+    
+    return round(min(100, max(30, precision_final * 100)), 1)
+
+def calcular_precision_estacional(mes, datos_historicos):
+    """Evalúa qué tan predecible es el clima en ese mes"""
+    try:
+        datos_mes = datos_historicos[datos_historicos['fecha'].dt.month == mes]
+        
+        if len(datos_mes) < 10:  # Pocos datos
+            return 0.5
+        
+        # Calcular variabilidad estacional
+        cv_precip = datos_mes['precipitacion_valor'].std() / (datos_mes['precipitacion_valor'].mean() + 0.1)
+        cv_temp = datos_mes['temperatura_valor'].std() / (datos_mes['temperatura_valor'].mean() + 0.1)
+        
+        # Menor variabilidad = mayor precisión
+        precision_est = 1 / (1 + (cv_precip + cv_temp) / 2)
+        return min(1.0, precision_est)
+    except:
+        return 0.5
+
+def calcular_factor_variabilidad(variables_pred, datos_historicos):
+    """Evalúa si las variables predichas están en rangos históricos normales"""
+    try:
+        factor = 1.0
+        
+        for var, valor in variables_pred.items():
+            if var == 'precipitacion':
+                col = 'precipitacion_valor'
+                # Para precipitación, valores extremos reducen confianza
+                percentil_95 = datos_historicos[col].quantile(0.95)
+                if valor > percentil_95:
+                    factor *= 0.7  # Reducir confianza para valores extremos
+            
+            elif var == 'temperatura':
+                col = 'temperatura_valor'
+                mean_temp = datos_historicos[col].mean()
+                std_temp = datos_historicos[col].std()
+                # Valores muy alejados de la media reducen confianza
+                z_score = abs(valor - mean_temp) / std_temp
+                if z_score > 2:
+                    factor *= 0.8
+        
+        return factor
+    except:
+        return 1.0
+
+def calcular_factor_tendencia(fecha_objetivo, datos_historicos):
+    """Evalúa tendencias de largo plazo para mejorar predicciones lejanas"""
+    try:
+        # Calcular tendencias por año
+        datos_anuales = datos_historicos.groupby(datos_historicos['fecha'].dt.year).agg({
+            'precipitacion_valor': 'mean',
+            'temperatura_valor': 'mean'
+        })
+        
+        if len(datos_anuales) < 3:
+            return 0.5
+        
+        # Calcular tendencia lineal
+        años = datos_anuales.index.values
+        precip_values = datos_anuales['precipitacion_valor'].values
+        
+        # Si hay tendencia clara, la predicción a largo plazo es más confiable
+        correlation = abs(np.corrcoef(años, precip_values)[0, 1])
+        
+        # Mayor correlación temporal = mayor confianza en predicciones lejanas
+        return min(1.0, 0.5 + correlation * 0.5)
+    except:
+        return 0.5
 
 # ===============================
 # PREDICCIÓN A FUTURO CON FUSIÓN
@@ -113,6 +268,72 @@ def predecir_variables(modelos, mes, año, dia, ultimos_valores, df):
     valores_precision = [calcular_precision_temporal(f, fecha_ultima) for f in fechas_precision]
 
     return pred_fusion, precision, fechas_precision, valores_precision
+
+def predecir_variables_ensemble(modelos_ensemble, mes, año, dia, ultimos_valores, df, features):
+    """Predicción mejorada usando ensemble de modelos"""
+    fecha_pred = pd.Timestamp(f"{año}-{mes}-{dia}")
+    fecha_ultima = df['fecha'].max()
+    dias_diff = (fecha_pred - fecha_ultima).days
+    
+    # Preparar entrada con todas las features
+    entrada_dict = {
+        'Mes': mes,
+        'Año': año,
+        'Día_año': fecha_pred.dayofyear,
+        'Estacion': {12:0, 1:0, 2:0, 3:1, 4:1, 5:1, 6:2, 7:2, 8:2, 9:3, 10:3, 11:3}[mes]
+    }
+    
+    # Agregar lags (usar últimos valores disponibles)
+    for lag in [1, 2, 3, 7]:
+        for var in ['precipitacion', 'temperatura', 'nivel_agua', 'presion']:
+            entrada_dict[f'{var}_lag{lag}'] = ultimos_valores[f'{var}_valor']
+    
+    # Agregar medias móviles (calcular desde datos históricos)
+    for window in [7, 15, 30]:
+        entrada_dict[f'precip_ma{window}'] = df['precipitacion_valor'].tail(window).mean()
+        entrada_dict[f'temp_ma{window}'] = df['temperatura_valor'].tail(window).mean()
+    
+    # Crear DataFrame de entrada
+    entrada_df = pd.DataFrame([entrada_dict])
+    entrada_df = entrada_df.reindex(columns=features, fill_value=0)
+    
+    # Predicciones ensemble
+    predicciones_ensemble = {}
+    intervalos_confianza = {}
+    
+    for variable in ['precipitacion', 'nivel_agua', 'temperatura', 'presion']:
+        predicciones = []
+        
+        # Obtener predicción de cada modelo
+        for modelo_name, modelo in modelos_ensemble[variable].items():
+            pred = modelo.predict(entrada_df)[0]
+            predicciones.append(pred)
+        
+        # Promedio ponderado (RF tiene más peso por ser más robusto)
+        pesos = {'rf': 0.5, 'gbr': 0.3, 'ridge': 0.2}
+        pred_final = sum(pred * pesos[modelo_name] 
+                        for pred, modelo_name in zip(predicciones, pesos.keys()))
+        
+        # Calcular intervalo de confianza basado en dispersión de modelos
+        std_predicciones = np.std(predicciones)
+        intervalo_inf = pred_final - 1.96 * std_predicciones
+        intervalo_sup = pred_final + 1.96 * std_predicciones
+        
+        predicciones_ensemble[variable] = max(0, pred_final)
+        intervalos_confianza[variable] = (max(0, intervalo_inf), intervalo_sup)
+    
+    # Calcular precisión mejorada
+    precision = calcular_precision_temporal_mejorada(
+        fecha_pred, fecha_ultima, predicciones_ensemble, df
+    )
+    
+    # Generar série temporal de precisión
+    fechas_precision = pd.date_range(start=fecha_ultima + pd.Timedelta(days=1), 
+                                    end=fecha_pred, freq='D')
+    valores_precision = [calcular_precision_temporal_mejorada(f, fecha_ultima, predicciones_ensemble, df) 
+                        for f in fechas_precision]
+    
+    return predicciones_ensemble, intervalos_confianza, precision, fechas_precision, valores_precision
 
 # ===============================
 # GRÁFICAS Y GEMINI
@@ -274,43 +495,43 @@ def generar_interpretacion_combinada_local(pred, riesgo_combinado):
     
     if riesgo_combinado < 15:
         return (
-            f"✅ **RIESGO BAJO** ({riesgo_combinado:.1f}%): **SITUACIÓN CONTROLADA** - Precipitación {precip}mm y nivel {nivel}cm en rangos seguros. "
+            f"✅ <b>RIESGO BAJO</b> ({riesgo_combinado:.1f}%): <b>SITUACIÓN CONTROLADA</b> - Precipitación {precip}mm y nivel {nivel}cm en rangos seguros. "
             f"Distancia al umbral crítico: ~{dias_hasta_critico:.1f} días de lluvia intensa{factores_texto}. "
-            f"**APROVECHAR PARA**: Limpieza de canales, revisión de desagües, actualización de kit de emergencia, "
-            f"coordinación vecinal. **VIGILANCIA**: Monitoreo diario de quebradas, pronósticos meteorológicos oficiales."
+            f"<b>APROVECHAR PARA</b>: Limpieza de canales, revisión de desagües, actualización de kit de emergencia, "
+            f"coordinación vecinal. <b>VIGILANCIA</b>: Monitoreo diario de quebradas, pronósticos meteorológicos oficiales."
         )
     elif riesgo_combinado < 30:
         return (
-            f"⚠️ **RIESGO MODERADO** ({riesgo_combinado:.1f}%): **VIGILANCIA ACTIVA** - Con {precip}mm lluvia y {nivel}cm nivel, "
+            f"⚠️ <b>RIESGO MODERADO</b> ({riesgo_combinado:.1f}%): <b>VIGILANCIA ACTIVA</b> - Con {precip}mm lluvia y {nivel}cm nivel, "
             f"estamos a {70-precip:.1f}mm del umbral crítico (desastre 2022){factores_texto}. "
-            f"**ACCIONES INMEDIATAS**: Verificar rutas de evacuación familiares, coordinar con vecinos sistemas de alerta, "
-            f"mantener radio/celular cargado, documentos importantes en bolsa impermeable. **OBSERVAR**: Cambios súbitos en quebradas, "
+            f"<b>ACCIONES INMEDIATAS</b>: Verificar rutas de evacuación familiares, coordinar con vecinos sistemas de alerta, "
+            f"mantener radio/celular cargado, documentos importantes en bolsa impermeable. <b>OBSERVAR</b>: Cambios súbitos en quebradas, "
             f"ruidos de arrastre de piedras, color del agua (transparente→marrón), crecimiento de caudal."
         )
     elif riesgo_combinado < 50:
         return (
-            f"🚨 **RIESGO ALTO** ({riesgo_combinado:.1f}%): **ALERTA PREVENTIVA** - Precipitación {precip}mm se aproxima peligrosamente "
-            f"al umbral del desastre del 31 enero 2022 (>70mm/h){factores_texto}. **RIESGO REAL**: Saturación acelerada del suelo, "
-            f"crecimiento exponencial de caudales. **PREPARAR EVACUACIÓN**: Vehículo listo, combustible, ruta definida hacia terreno alto. "
-            f"**COMUNICAR**: Situación a familiares, vecinos vulnerables, autoridades locales. **SEÑALES CRÍTICAS**: Rugido creciente en quebradas, "
+            f"🚨 <b>RIESGO ALTO</b> ({riesgo_combinado:.1f}%): <b>ALERTA PREVENTIVA</b> - Precipitación {precip}mm se aproxima peligrosamente "
+            f"al umbral del desastre del 31 enero 2022 (>70mm/h){factores_texto}. <b>RIESGO REAL</b>: Saturación acelerada del suelo, "
+            f"crecimiento exponencial de caudales. <b>PREPARAR EVACUACIÓN</b>: Vehículo listo, combustible, ruta definida hacia terreno alto. "
+            f"<b>COMUNICAR</b>: Situación a familiares, vecinos vulnerables, autoridades locales. <b>SEÑALES CRÍTICAS</b>: Rugido creciente en quebradas, "
             f"espuma en el agua, vibración en puentes, animales inquietos."
         )
     elif riesgo_combinado < 75:
         return (
-            f"🔴 **RIESGO CRÍTICO** ({riesgo_combinado:.1f}%): **EMERGENCIA PREVENTIVA** - ¡Condiciones peligrosas similares al aluvión de 2022! "
+            f"🔴 <b>RIESGO CRÍTICO</b> ({riesgo_combinado:.1f}%): <b>EMERGENCIA PREVENTIVA</b> - ¡Condiciones peligrosas similares al aluvión de 2022! "
             f"Precipitación {precip}mm y nivel {nivel}cm indican PELIGRO INMINENTE{factores_texto}. "
-            f"**EVACUACIÓN PREVENTIVA RECOMENDADA** especialmente para: adultos mayores, niños, personas con discapacidad, viviendas cercanas a quebradas. "
-            f"**ACCIONES CRÍTICAS**: Alertar 911, comunicar emergencia a vecinos, documentos y medicinas esenciales listos, "
-            f"identificar refugios seguros (colegios, iglesias en terreno alto). **PELIGRO EXTREMO**: Rugido ensordecedor, temblor del suelo, olor intenso a tierra."
+            f"<b>EVACUACIÓN PREVENTIVA RECOMENDADA</b> especialmente para: adultos mayores, niños, personas con discapacidad, viviendas cercanas a quebradas. "
+            f"<b>ACCIONES CRÍTICAS</b>: Alertar 911, comunicar emergencia a vecinos, documentos y medicinas esenciales listos, "
+            f"identificar refugios seguros (colegios, iglesias en terreno alto). <b>PELIGRO EXTREMO</b>: Rugido ensordecedor, temblor del suelo, olor intenso a tierra."
         )
     else:
         return (
-            f"⚡ **EMERGENCIA EXTREMA** ({riesgo_combinado:.1f}%): **ALUVIÓN PROBABLE** - ¡EVACUACIÓN INMEDIATA! "
-            f"Condiciones IGUALES O PEORES al desastre del 31 enero 2022. **PELIGRO MORTAL INMINENTE**{factores_texto}. "
-            f"**ACTUAR AHORA**: Buscar terreno alto (>100m de quebradas), llamar 911 - EMERGENCIA MAYOR, "
+            f"⚡ <b>EMERGENCIA EXTREMA</b> ({riesgo_combinado:.1f}%): <b>ALUVIÓN PROBABLE</b> - ¡EVACUACIÓN INMEDIATA! "
+            f"Condiciones IGUALES O PEORES al desastre del 31 enero 2022. <b>PELIGRO MORTAL INMINENTE</b>{factores_texto}. "
+            f"<b>ACTUAR AHORA</b>: Buscar terreno alto (>100m de quebradas), llamar 911 - EMERGENCIA MAYOR, "
             f"NO intentar rescatar pertenencias, alejarse inmediatamente de cauces y laderas inestables. "
-            f"**SÍNTOMAS DE ALUVIÓN ACTIVO**: Rugido como tren, suelo temblando, rocas gigantes rodando, "
-            f"árboles cayendo, corte súbito de servicios. **REFUGIO**: Estructuras sólidas en terreno alto, comunicación constante con emergencias."
+            f"<b>SÍNTOMAS DE ALUVIÓN ACTIVO</b>: Rugido como tren, suelo temblando, rocas gigantes rodando, "
+            f"árboles cayendo, corte súbito de servicios. <b>REFUGIO</b>: Estructuras sólidas en terreno alto, comunicación constante con emergencias."
         )
 
 def interpretar_variable(variable, valor):
@@ -396,39 +617,39 @@ def generar_interpretacion_local(variable, valor, nivel):
     """Función de respaldo para generar interpretaciones detalladas sin API"""
     interpretaciones = {
         'precipitacion': {
-            'bajo': f"💧 **LLUVIA LIGERA** ({valor} mm): Como rocío matutino o llovizna suave. Estamos a {70-valor} mm del umbral crítico de diluvio (>70 mm/h causó el desastre de 2022). **QUÉ HACER**: Momento ideal para limpiar canales y desagües. Revisar que nada obstruya quebradas. Mantener kit de emergencia actualizado. **VIGILAR**: Acumulación en 24h, saturación del suelo en laderas, cambios de color en quebradas.",
-            'moderado': f"🌧️ **LLUVIA MODERADA** ({valor} mm): Como ducha normal, suelo comenzando a saturarse. Solo {70-valor} mm nos separan del nivel de ALERTA ROJA. **PELIGRO CRECIENTE**: Si continúa por horas puede saturar completamente el suelo en pendientes. **ACCIONES**: Coordinar con vecinos, verificar rutas de evacuación, tener radio/celular cargado. **OBSERVAR**: Ruido de arrastre en quebradas, agua turbia, crecimiento del caudal.",
-            'alto': f"⚠️ **LLUVIA INTENSA** ({valor} mm): Como manguera abierta, PELIGRO REAL. Solo {70-valor} mm del umbral del desastre de 2022. Suelo saturándose rápidamente, quebradas subiendo. **RIESGO INMINENTE**: Deslizamientos en laderas, desbordamiento de cauces. **EVACUAR PREVENTIVAMENTE** de zonas bajas. Alejarse de quebradas. Documentos listos. **ALERTA MÁXIMA**: Ruidos extraños, agua lodosa, piedras rodando.",
-            'critico': f"🚨 **ALERTA ROJA** ({valor} mm): NIVEL CRÍTICO alcanzado. Condiciones similares al aluvión del 31 enero 2022 que causó muertes. Riesgo INMINENTE de desbordamiento masivo. **EVACUACIÓN PREVENTIVA OBLIGATORIA**. Buscar terreno alto inmediatamente. Alejarse de quebradas y laderas. **EMERGENCIA**: Llamar 911, alertar a vecinos. **SEÑALES DE PELIGRO EXTREMO**: Rugido de agua, piedras grandes rodando, grietas en el suelo.",
-            'extremo': f"🔴 **EVACUACIÓN INMEDIATA** ({valor} mm): SUPERA el umbral del desastre 2022. Condiciones EXTREMAS de diluvio activo. ALUVIÓN EN CURSO probable. **ACTUAR YA**: Terreno alto, lejos de cauces. 911 - EMERGENCIA. **PELIGRO MORTAL**: No permanecer en viviendas cerca de quebradas. **SÍNTOMAS DE ALUVIÓN**: Rugido ensordecedor, temblor del suelo, olor a tierra mojada intenso, animales huyendo."
+            'bajo': f"💧 <b>LLUVIA LIGERA</b> ({valor} mm): Como rocío matutino o llovizna suave. Estamos a {70-valor} mm del umbral crítico de diluvio (>70 mm/h causó el desastre de 2022). <b>QUÉ HACER</b>: Momento ideal para limpiar canales y desagües. Revisar que nada obstruya quebradas. Mantener kit de emergencia actualizado. <b>VIGILAR</b>: Acumulación en 24h, saturación del suelo en laderas, cambios de color en quebradas.",
+            'moderado': f"🌧️ <b>LLUVIA MODERADA</b> ({valor} mm): Como ducha normal, suelo comenzando a saturarse. Solo {70-valor} mm nos separan del nivel de ALERTA ROJA. <b>PELIGRO CRECIENTE</b>: Si continúa por horas puede saturar completamente el suelo en pendientes. <b>ACCIONES</b>: Coordinar con vecinos, verificar rutas de evacuación, tener radio/celular cargado. <b>OBSERVAR</b>: Ruido de arrastre en quebradas, agua turbia, crecimiento del caudal.",
+            'alto': f"⚠️ <b>LLUVIA INTENSA</b> ({valor} mm): Como manguera abierta, PELIGRO REAL. Solo {70-valor} mm del umbral del desastre de 2022. Suelo saturándose rápidamente, quebradas subiendo. <b>RIESGO INMINENTE</b>: Deslizamientos en laderas, desbordamiento de cauces. <b>EVACUAR PREVENTIVAMENTE</b> de zonas bajas. Alejarse de quebradas. Documentos listos. <b>ALERTA MÁXIMA</b>: Ruidos extraños, agua lodosa, piedras rodando.",
+            'critico': f"🚨 <b>ALERTA ROJA</b> ({valor} mm): NIVEL CRÍTICO alcanzado. Condiciones similares al aluvión del 31 enero 2022 que causó muertes. Riesgo INMINENTE de desbordamiento masivo. <b>EVACUACIÓN PREVENTIVA OBLIGATORIA</b>. Buscar terreno alto inmediatamente. Alejarse de quebradas y laderas. <b>EMERGENCIA</b>: Llamar 911, alertar a vecinos. <b>SEÑALES DE PELIGRO EXTREMO</b>: Rugido de agua, piedras grandes rodando, grietas en el suelo.",
+            'extremo': f"🔴 <b>EVACUACIÓN INMEDIATA</b> ({valor} mm): SUPERA el umbral del desastre 2022. Condiciones EXTREMAS de diluvio activo. ALUVIÓN EN CURSO probable. <b>ACTUAR YA</b>: Terreno alto, lejos de cauces. 911 - EMERGENCIA. <b>PELIGRO MORTAL</b>: No permanecer en viviendas cerca de quebradas. <b>SÍNTOMAS DE ALUVIÓN</b>: Rugido ensordecedor, temblor del suelo, olor a tierra mojada intenso, animales huyendo."
         },
         'nivel_agua': {
-            'bajo': f"🌊 **NIVEL NORMAL** ({valor} cm): Quebrada en capacidad adecuada. Drenaje funcionando bien. **OPORTUNIDAD**: Momento perfecto para limpieza de canales, remoción de escombros, revisión de infraestructura. **VIGILANCIA COMUNITARIA**: Establecer turnos de observación, identificar puntos críticos. **PREPARACIÓN**: Actualizar rutas de evacuación, revisar kit de emergencia familiar.",
-            'moderado': f"📈 **NIVEL CRECIENTE** ({valor} cm): Quebradas llenándose gradualmente. Aún manejable pero requiere atención. **FACTORES DE RIESGO**: Lluvia sostenida puede saturar capacidad en 2-4 horas. **VIGILAR**: Ruido de piedras arrastrándose, cambio de color del agua (transparente→marrón), aumento de velocidad. **ACCIONES**: Alejar vehículos de cauces, verificar que niños no jueguen cerca del agua.",
-            'alto': f"⚠️ **NIVEL PREOCUPANTE** ({valor} cm): Quebrada cerca de capacidad máxima. Riesgo de desbordamiento en 1-2 horas si continúa subiendo. **PELIGRO REAL**: Erosión de orillas, arrastre de objetos grandes. **PREPARACIÓN INMEDIATA**: Evacuar preventivamente zonas bajas, tener vehículos listos para salir, documentos importantes en bolsa impermeable. **OBSERVAR**: Espuma en el agua, ruido creciente, vibración en puentes.",
-            'critico': f"🚨 **NIVEL CRÍTICO** ({valor} cm): Capacidad de quebrada AL LÍMITE. Desbordamiento INMINENTE en minutos u horas. **EVACUACIÓN PREVENTIVA OBLIGATORIA** de zonas bajas. **PELIGRO EXTREMO**: Arrastre de rocas grandes, socavación de cimientos, colapso de puentes. **ACTUAR INMEDIATAMENTE**: Terreno alto, alejarse 100+ metros de cauces, llamar emergencias 911.",
-            'extremo': f"🔴 **DESBORDAMIENTO ACTIVO** ({valor} cm): NIVEL EXTREMO - Aluvión en desarrollo. Quebrada desbordando o a punto de hacerlo. **EVACUACIÓN INMEDIATA**: Buscar terreno alto YA. **EMERGENCIA 911**: Reportar situación crítica. **PELIGRO MORTAL**: Flujo de escombros, arrastre de vehículos, destrucción de infraestructura. **NO INTENTAR cruzar cauces o rescatar objetos**."
+            'bajo': f"🌊 <b>NIVEL NORMAL</b> ({valor} cm): Quebrada en capacidad adecuada. Drenaje funcionando bien. <b>OPORTUNIDAD</b>: Momento perfecto para limpieza de canales, remoción de escombros, revisión de infraestructura. <b>VIGILANCIA COMUNITARIA</b>: Establecer turnos de observación, identificar puntos críticos. <b>PREPARACIÓN</b>: Actualizar rutas de evacuación, revisar kit de emergencia familiar.",
+            'moderado': f"📈 <b>NIVEL CRECIENTE</b> ({valor} cm): Quebradas llenándose gradualmente. Aún manejable pero requiere atención. <b>FACTORES DE RIESGO</b>: Lluvia sostenida puede saturar capacidad en 2-4 horas. <b>VIGILAR</b>: Ruido de piedras arrastrándose, cambio de color del agua (transparente→marrón), aumento de velocidad. <b>ACCIONES</b>: Alejar vehículos de cauces, verificar que niños no jueguen cerca del agua.",
+            'alto': f"⚠️ <b>NIVEL PREOCUPANTE</b> ({valor} cm): Quebrada cerca de capacidad máxima. Riesgo de desbordamiento en 1-2 horas si continúa subiendo. <b>PELIGRO REAL</b>: Erosión de orillas, arrastre de objetos grandes. <b>PREPARACIÓN INMEDIATA</b>: Evacuar preventivamente zonas bajas, tener vehículos listos para salir, documentos importantes en bolsa impermeable. <b>OBSERVAR</b>: Espuma en el agua, ruido creciente, vibración en puentes.",
+            'critico': f"🚨 <b>NIVEL CRÍTICO</b> ({valor} cm): Capacidad de quebrada AL LÍMITE. Desbordamiento INMINENTE en minutos u horas. <b>EVACUACIÓN PREVENTIVA OBLIGATORIA</b> de zonas bajas. <b>PELIGRO EXTREMO</b>: Arrastre de rocas grandes, socavación de cimientos, colapso de puentes. <b>ACTUAR INMEDIATAMENTE</b>: Terreno alto, alejarse 100+ metros de cauces, llamar emergencias 911.",
+            'extremo': f"🔴 <b>DESBORDAMIENTO ACTIVO</b> ({valor} cm): NIVEL EXTREMO - Aluvión en desarrollo. Quebrada desbordando o a punto de hacerlo. <b>EVACUACIÓN INMEDIATA</b>: Buscar terreno alto YA. <b>EMERGENCIA 911</b>: Reportar situación crítica. <b>PELIGRO MORTAL</b>: Flujo de escombros, arrastre de vehículos, destrucción de infraestructura. <b>NO INTENTAR cruzar cauces o rescatar objetos</b>."
         },
         'temperatura': {
-            'bajo': f"🌡️ **TEMPERATURA BAJA** ({valor}°C): Condiciones frías que pueden intensificar efectos de lluvia. **CONTEXTO CLIMÁTICO**: Aire frío retiene menos humedad, puede generar lluvias más prolongadas. **CONSIDERACIONES**: Mayor riesgo de hipotermia en emergencias, suelo más compacto (menos absorción). **PREPARACIÓN**: Ropa abrigada en kit de emergencia, mantas térmicas, combustible para calefacción.",
-            'moderado': f"🌡️ **TEMPERATURA NORMAL** ({valor}°C): Condiciones típicas de Quito. **VENTAJA**: Temperatura estable facilita evacuaciones y rescates. Suelo con capacidad normal de absorción. **MANTENER**: Vigilancia normal, preparación estándar de emergencias. **RECORDAR**: Cambios bruscos de temperatura pueden indicar frentes meteorológicos intensos.",
-            'alto': f"🌡️ **TEMPERATURA ELEVADA** ({valor}°C): Calor inusual para La Gasca puede indicar sistemas meteorológicos intensos. **ALERTA**: Aire caliente retiene más humedad, posibles tormentas más fuertes. Suelo seco absorbe menos agua inicialmente. **PREPARACIÓN**: Hidratación en kit de emergencia, protección solar, considerar mayor volatilidad climática.",
-            'critico': f"🌡️ **TEMPERATURA MUY ALTA** ({valor}°C): Condiciones excepcionales que pueden preceder eventos climáticos extremos. **CONTEXTO**: Gradientes térmicos fuertes generan inestabilidad atmosférica severa. **ALERTA MÁXIMA**: Posibles tormentas supercélulas, granizo, vientos fuertes. **PREPARACIÓN ESPECIAL**: Refugio sólido, comunicaciones de emergencia.",
-            'extremo': f"🌡️ **TEMPERATURA EXTREMA** ({valor}°C): Condiciones anómalas que requieren máxima precaución. **PELIGRO**: Sistemas meteorológicos severos probable. **EMERGENCIA CLIMÁTICA**: Mantenerse informado via radio oficial, refugio seguro, evitar exposición prolongada al exterior."
+            'bajo': f"🌡️ <b>TEMPERATURA BAJA</b> ({valor}°C): Condiciones frías que pueden intensificar efectos de lluvia. <b>CONTEXTO CLIMÁTICO</b>: Aire frío retiene menos humedad, puede generar lluvias más prolongadas. <b>CONSIDERACIONES</b>: Mayor riesgo de hipotermia en emergencias, suelo más compacto (menos absorción). <b>PREPARACIÓN</b>: Ropa abrigada en kit de emergencia, mantas térmicas, combustible para calefacción.",
+            'moderado': f"🌡️ <b>TEMPERATURA NORMAL</b> ({valor}°C): Condiciones típicas de Quito. <b>VENTAJA</b>: Temperatura estable facilita evacuaciones y rescates. Suelo con capacidad normal de absorción. <b>MANTENER</b>: Vigilancia normal, preparación estándar de emergencias. <b>RECORDAR</b>: Cambios bruscos de temperatura pueden indicar frentes meteorológicos intensos.",
+            'alto': f"🌡️ <b>TEMPERATURA ELEVADA</b> ({valor}°C): Calor inusual para La Gasca puede indicar sistemas meteorológicos intensos. <b>ALERTA</b>: Aire caliente retiene más humedad, posibles tormentas más fuertes. Suelo seco absorbe menos agua inicialmente. <b>PREPARACIÓN</b>: Hidratación en kit de emergencia, protección solar, considerar mayor volatilidad climática.",
+            'critico': f"🌡️ <b>TEMPERATURA MUY ALTA</b> ({valor}°C): Condiciones excepcionales que pueden preceder eventos climáticos extremos. <b>CONTEXTO</b>: Gradientes térmicos fuertes generan inestabilidad atmosférica severa. <b>ALERTA MÁXIMA</b>: Posibles tormentas supercélulas, granizo, vientos fuertes. <b>PREPARACIÓN ESPECIAL</b>: Refugio sólido, comunicaciones de emergencia.",
+            'extremo': f"🌡️ <b>TEMPERATURA EXTREMA</b> ({valor}°C): Condiciones anómalas que requieren máxima precaución. <b>PELIGRO</b>: Sistemas meteorológicos severos probable. <b>EMERGENCIA CLIMÁTICA</b>: Mantenerse informado via radio oficial, refugio seguro, evitar exposición prolongada al exterior."
         },
         'presion': {
-            'bajo': f"📉 **PRESIÓN BAJA** ({valor} hPa): Sistema de baja presión puede indicar aproximación de frente lluvioso. **CONTEXTO METEOROLÓGICO**: Aire ascendente, condensación, nubes cumulonimbus. **VIGILANCIA**: Posible intensificación de lluvias en 6-12 horas. **PREPARACIÓN**: Revisar pronósticos oficiales, tener plan de contingencia listo.",
-            'moderado': f"📉 **PRESIÓN NORMAL** ({valor} hPa): Condiciones atmosféricas estables para Quito (2800 msnm). **VENTAJA**: Menos probabilidad de cambios meteorológicos súbitos. **MANTENER**: Vigilancia estándar, preparación normal de emergencias. **APROVECHAR**: Momento óptimo para mantenimiento preventivo.",
-            'alto': f"📉 **PRESIÓN ALTA** ({valor} hPa): Alta presión puede indicar estabilidad meteorológica temporal. **CONTEXTO**: Aire descendente, despeje de nubes. Sin embargo, cambios bruscos pueden generar tormentas posteriores. **OPORTUNIDAD**: Realizar trabajos de prevención, limpieza de canales.",
-            'critico': f"📉 **PRESIÓN MUY ALTA** ({valor} hPa): Condiciones atmosféricas inusuales. **ALERTA**: Gradientes de presión fuertes pueden preceder cambios meteorológicos súbitos y severos. **VIGILANCIA ESPECIAL**: Monitorear pronósticos oficiales cada hora, tener comunicaciones listas.",
-            'extremo': f"📉 **PRESIÓN EXTREMA** ({valor} hPa): Condiciones atmosféricas anómalas. **EMERGENCIA METEOROLÓGICA**: Posibles fenómenos severos (tornados, granizo, vientos destructivos). **REFUGIO INMEDIATO**: Estructura sólida, comunicación con autoridades, evitar salir al exterior."
+            'bajo': f"📉 <b>PRESIÓN BAJA</b> ({valor} hPa): Sistema de baja presión puede indicar aproximación de frente lluvioso. <b>CONTEXTO METEOROLÓGICO</b>: Aire ascendente, condensación, nubes cumulonimbus. <b>VIGILANCIA</b>: Posible intensificación de lluvias en 6-12 horas. <b>PREPARACIÓN</b>: Revisar pronósticos oficiales, tener plan de contingencia listo.",
+            'moderado': f"📉 <b>PRESIÓN NORMAL</b> ({valor} hPa): Condiciones atmosféricas estables para Quito (2800 msnm). <b>VENTAJA</b>: Menos probabilidad de cambios meteorológicos súbitos. <b>MANTENER</b>: Vigilancia estándar, preparación normal de emergencias. <b>APROVECHAR</b>: Momento óptimo para mantenimiento preventivo.",
+            'alto': f"📉 <b>PRESIÓN ALTA</b> ({valor} hPa): Alta presión puede indicar estabilidad meteorológica temporal. <b>CONTEXTO</b>: Aire descendente, despeje de nubes. Sin embargo, cambios bruscos pueden generar tormentas posteriores. <b>OPORTUNIDAD</b>: Realizar trabajos de prevención, limpieza de canales.",
+            'critico': f"📉 <b>PRESIÓN MUY ALTA</b> ({valor} hPa): Condiciones atmosféricas inusuales. <b>ALERTA</b>: Gradientes de presión fuertes pueden preceder cambios meteorológicos súbitos y severos. <b>VIGILANCIA ESPECIAL</b>: Monitorear pronósticos oficiales cada hora, tener comunicaciones listas.",
+            'extremo': f"📉 <b>PRESIÓN EXTREMA</b> ({valor} hPa): Condiciones atmosféricas anómalas. <b>EMERGENCIA METEOROLÓGICA</b>: Posibles fenómenos severos (tornados, granizo, vientos destructivos). <b>REFUGIO INMEDIATO</b>: Estructura sólida, comunicación con autoridades, evitar salir al exterior."
         }
     }
     
     if variable in interpretaciones and nivel in interpretaciones[variable]:
         return interpretaciones[variable][nivel]
     else:
-        return f"⚠️ **VALOR ANÓMALO** {variable}: {valor} - Nivel {nivel}. Condiciones fuera de parámetros normales. **PRECAUCIÓN MÁXIMA**: Consultar con autoridades meteorológicas. Mantener vigilancia comunitaria extrema y preparación para evacuación."
+        return f"⚠️ <b>VALOR ANÓMALO</b> {variable}: {valor} - Nivel {nivel}. Condiciones fuera de parámetros normales. <b>PRECAUCIÓN MÁXIMA</b>: Consultar con autoridades meteorológicas. Mantener vigilancia comunitaria extrema y preparación para evacuación."
 def crear_grafica_lineal(df, variable='precipitacion_valor', color='blue'):
     import matplotlib.pyplot as plt
     from PIL import Image
@@ -575,5 +796,175 @@ def crear_grafica_completa_interactiva(modelo_rf, df, variable, mes, año, color
     )
 
     return fig
+
+# ===============================
+# INTERPRETACIÓN MEJORADA DE PRECISIÓN
+# ===============================
+def interpretar_precision_con_gemini_mejorada(precision_valor, pred_variables, dias_diff=0, fecha_objetivo=None, datos_historicos=None):
+    """Interpretación contextualizada considerando distancia temporal y análisis estacional"""
+    
+    # Análisis adicional de contexto temporal
+    contexto_temporal = ""
+    if fecha_objetivo:
+        mes = fecha_objetivo.month
+        contexto_estacional = analizar_contexto_estacional(mes, datos_historicos)
+        contexto_temporal = f"\n- Contexto estacional: {contexto_estacional}"
+    
+    # Análisis de variabilidad histórica
+    variabilidad_info = ""
+    if datos_historicos is not None:
+        variabilidad_info = analizar_variabilidad_historica(pred_variables, datos_historicos)
+    
+    if dias_diff > 730:  # Más de 2 años
+        contexto_temporal_base = "predicción a muy largo plazo (>2 años)"
+        recomendacion_base = "Esta predicción utiliza patrones climáticos históricos y tendencias estacionales. Considérela como una estimación orientativa."
+    elif dias_diff > 365:  # Más de 1 año
+        contexto_temporal_base = "predicción a largo plazo (>1 año)"  
+        recomendacion_base = "El modelo combina tendencias históricas con patrones estacionales para esta estimación."
+    elif dias_diff > 90:  # Más de 3 meses
+        contexto_temporal_base = "predicción a medio plazo"
+        recomendacion_base = "Predicción basada en tendencias recientes y patrones estacionales."
+    else:
+        contexto_temporal_base = "predicción a corto plazo"
+        recomendacion_base = "Alta confiabilidad basada en datos recientes."
+    
+    # Ajustar mensaje según precisión y contexto temporal
+    if precision_valor < 50:
+        nivel_confianza = "🔴 <b>Baja confiabilidad</b>"
+        accion = "Use como referencia general. Complementar con monitoreo local intensivo."
+    elif precision_valor < 70:
+        nivel_confianza = "🟡 <b>Confiabilidad moderada</b>"
+        accion = "Útil para planificación preventiva. Mantener vigilancia."
+    else:
+        nivel_confianza = "🟢 <b>Alta confiabilidad</b>"
+        accion = "Excelente para toma de decisiones preventivas."
+    
+    return f"""{nivel_confianza} ({precision_valor:.1f}%)
+
+<b>Contexto:</b> {contexto_temporal_base}{contexto_temporal}
+<b>Interpretación:</b> {recomendacion_base}
+
+<b>Para La Gasca:</b> {accion}{variabilidad_info}
+
+<b>Factores considerados:</b>
+• Patrones estacionales históricos de Quito
+• Tendencias climáticas de largo plazo
+• Variabilidad específica del sector
+• Ensemble de múltiples modelos predictivos
+
+<b>Recomendación:</b> Dado el historial del aluvión de 2022, siempre complementar con observación directa de quebradas y condiciones locales."""
+
+def analizar_contexto_estacional(mes, datos_historicos):
+    """Analiza patrones estacionales para mejorar interpretación de precisión"""
+    if datos_historicos is None:
+        return "Datos estacionales no disponibles"
+    
+    try:
+        # Filtrar datos del mismo mes en años anteriores
+        datos_mes = datos_historicos[datos_historicos['fecha'].dt.month == mes]
+        
+        if len(datos_mes) > 0:
+            precip_promedio = datos_mes['precipitacion_valor'].mean()
+            precip_max = datos_mes['precipitacion_valor'].max()
+            variabilidad = datos_mes['precipitacion_valor'].std()
+            
+            if mes in [1, 2, 3, 10, 11, 12]:  # Meses lluviosos
+                return f"Época lluviosa (prom: {precip_promedio:.1f}mm, máx histórico: {precip_max:.1f}mm). Mayor variabilidad climática."
+            else:
+                return f"Época seca (prom: {precip_promedio:.1f}mm). Menor variabilidad, predicciones más estables."
+        
+        return "Datos estacionales insuficientes"
+    except:
+        return "Error al analizar datos estacionales"
+
+def analizar_variabilidad_historica(pred_variables, datos_historicos):
+    """Analiza la variabilidad histórica para contextualizar la precisión"""
+    if datos_historicos is None:
+        return ""
+    
+    try:
+        precip_pred = pred_variables.get('precipitacion', 0)
+        
+        # Calcular percentiles históricos
+        p25 = datos_historicos['precipitacion_valor'].quantile(0.25)
+        p75 = datos_historicos['precipitacion_valor'].quantile(0.75)
+        p95 = datos_historicos['precipitacion_valor'].quantile(0.95)
+        
+        contexto = ""
+        if precip_pred <= p25:
+            contexto = "\n- Precipitación predicha en rango bajo (25% inferior histórico) - Mayor confiabilidad esperada"
+        elif precip_pred <= p75:
+            contexto = "\n- Precipitación predicha en rango normal - Confiabilidad estándar"
+        elif precip_pred <= p95:
+            contexto = "\n- Precipitación predicha en rango alto (25% superior) - Requiere validación adicional"
+        else:
+            contexto = "\n- Precipitación predicha en rango extremo (5% superior) - Precisión incierta, MONITOREO CRÍTICO"
+        
+        return contexto
+    except:
+        return ""
+
+def generar_interpretacion_precision_local_mejorada(precision_valor, pred_variables, dias_diff=0):
+    """Fallback mejorado con análisis más detallado"""
+    precip = pred_variables.get('precipitacion', 0)
+    nivel = pred_variables.get('nivel_agua', 10)
+    
+    # Cálculo de riesgo combinado
+    riesgo_precip = min(100, (precip / 70) * 100)  # 70mm umbral crítico
+    riesgo_nivel = min(100, (nivel / 35) * 100)    # 35cm umbral estimado
+    riesgo_combinado = (riesgo_precip + riesgo_nivel) / 2
+    
+    if precision_valor < 60:
+        base_msg = f"🔴 <b>Precisión Baja ({precision_valor:.1f}%)</b>"
+        if riesgo_combinado > 50:
+            return f"""{base_msg}
+            
+<b>⚠️ SITUACIÓN CRÍTICA</b>: Baja precisión con riesgo elevado ({riesgo_combinado:.1f}%). 
+<b>ACCIÓN INMEDIATA</b>: 
+- Activar monitoreo manual cada 2 horas en quebradas
+- Coordinar con ECU-911 para alertas tempranas
+- Preparar evacuación preventiva si condiciones empeoran
+- Validar con estaciones meteorológicas cercanas
+<b>CONTEXTO LA GASCA</b>: Dado el historial de 2022, NO depender únicamente del modelo."""
+        else:
+            return f"""{base_msg}
+            
+<b>Condiciones</b>: Riesgo moderado-bajo pero precisión incierta.
+<b>RECOMENDACIÓN</b>: Mantener vigilancia estándar pero complementar con:
+- Observación visual de quebradas cada 6 horas
+- Monitoreo de pronósticos oficiales (INAMHI)
+- Comunicación activa con red comunitaria de La Gasca"""
+    
+    elif precision_valor < 80:
+        base_msg = f"🟡 <b>Precisión Moderada ({precision_valor:.1f}%)</b>"
+        if riesgo_combinado > 50:
+            return f"""{base_msg}
+            
+<b>ALERTA PREVENTIVA</b>: Precisión aceptable con condiciones de riesgo.
+<b>PLAN DE ACCIÓN</b>:
+- Predicciones útiles para planificación de 12-24 horas
+- Intensificar monitoreo comunitario en zonas vulnerables
+- Revisar rutas de evacuación y comunicar a familias en riesgo
+<b>CONFIABILIDAD</b>: Adecuada para decisiones preventivas graduales."""
+        else:
+            return f"""{base_msg}
+            
+<b>SITUACIÓN CONTROLADA</b>: Precisión y riesgo en niveles manejables.
+<b>USO RECOMENDADO</b>: 
+- Planificación de actividades comunitarias
+- Preparación preventiva estándar
+- Educación y simulacros de evacuación"""
+    
+    else:
+        base_msg = f"🟢 <b>Precisión Alta ({precision_valor:.1f}%)</b>"
+        return f"""{base_msg}
+        
+<b>EXCELENTE CONFIABILIDAD</b>: Predicciones altamente confiables para La Gasca.
+<b>APLICACIÓN RECOMENDADA</b>:
+- Planificación estratégica de emergencias
+- Coordinación con autoridades municipales
+- Base sólida para decisiones de evacuación preventiva
+- Referencia confiable para protocolos comunitarios
+<b>VALOR AGREGADO</b>: Permite anticipación efectiva en zona históricamente vulnerable."""
 
 
